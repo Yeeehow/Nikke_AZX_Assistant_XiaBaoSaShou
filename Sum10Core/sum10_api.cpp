@@ -14,6 +14,12 @@
 #include <mutex>
 
 #include <opencv2/opencv.hpp>
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+#include <opencv2/core/cuda.hpp>
+#include <opencv2/cudaarithm.hpp>
+#include <opencv2/cudaimgproc.hpp>
+#include <opencv2/cudawarping.hpp>
+#endif
 
 // ---------- internal logging ----------
 static sum10_log_callback_t g_log_cb = nullptr;
@@ -21,6 +27,34 @@ static sum10_log_callback_t g_log_cb = nullptr;
 static void Log(const std::wstring& s) {
     if (g_log_cb) g_log_cb(s.c_str());
 }
+
+// ---------- cuda helpers ----------
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+static bool g_cuda_available = false;
+static std::once_flag g_cuda_once;
+
+static void DetectCudaOnce() {
+    try {
+        g_cuda_available = cv::cuda::getCudaEnabledDeviceCount() > 0;
+        if (g_cuda_available) {
+            Log(L"[Native] CUDA device detected; enabling GPU-accelerated paths.");
+        }
+        else {
+            Log(L"[Native] CUDA modules available but no device detected; using CPU fallback.");
+        }
+    }
+    catch (...) {
+        g_cuda_available = false;
+    }
+}
+
+static bool IsCudaAvailable() {
+    std::call_once(g_cuda_once, DetectCudaOnce);
+    return g_cuda_available;
+}
+#else
+static bool IsCudaAvailable() { return false; }
+#endif
 
 static std::string WStringToUtf8(const std::wstring& ws) {
     if (ws.empty()) return {};
@@ -103,6 +137,10 @@ struct DigitTemplates {
     // index 0..9, allow multiple templates per digit
     std::vector<cv::Mat> t[10];
     bool loaded[10]{};
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+    std::vector<cv::cuda::GpuMat> gpu_t[10];
+    bool gpu_loaded[10]{};
+#endif
 };
 
 static float ComputeMedian(const cv::Mat& gray) {
@@ -147,6 +185,7 @@ static std::vector<std::wstring> SplitTemplateDirs(const std::wstring& dirList) 
 static DigitTemplates LoadTemplates(const std::wstring& dirList) {
     DigitTemplates dt;
     auto dirs = SplitTemplateDirs(dirList);
+    bool useCuda = IsCudaAvailable();
 
     for (const auto& dir : dirs) {
         for (int d = 0; d <= 9; d++) {
@@ -164,6 +203,15 @@ static DigitTemplates LoadTemplates(const std::wstring& dirList) {
                 r.convertTo(r, CV_32F, 1.0 / 255.0);
                 dt.t[d].push_back(r);
                 dt.loaded[d] = true;
+
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+                if (useCuda) {
+                    cv::cuda::GpuMat g;
+                    g.upload(r);
+                    dt.gpu_t[d].push_back(std::move(g));
+                    dt.gpu_loaded[d] = true;
+                }
+#endif
             }
         }
     }
@@ -194,6 +242,10 @@ struct PreprocessResult {
     cv::Mat mat28f;
     float fgRatio{ 0.0f };
     float quality{ 0.0f };
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+    cv::cuda::GpuMat gpu28f;
+    bool hasGpu{ false };
+#endif
 };
 
 static cv::Mat RefineBounding(const cv::Mat& bin) {
@@ -212,7 +264,24 @@ static cv::Mat RefineBounding(const cv::Mat& bin) {
 
 static std::vector<PreprocessResult> PreprocessCellVariants(const cv::Mat& cellBgr) {
     cv::Mat gray;
-    cv::cvtColor(cellBgr, gray, cv::COLOR_BGR2GRAY);
+    bool useCuda = IsCudaAvailable();
+
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+    if (useCuda) {
+        try {
+            cv::cuda::GpuMat gBgr(cellBgr);
+            cv::cuda::GpuMat gGray;
+            cv::cuda::cvtColor(gBgr, gGray, cv::COLOR_BGR2GRAY);
+            gGray.download(gray);
+        }
+        catch (...) {
+            useCuda = false;
+        }
+    }
+#endif
+    if (!useCuda) {
+        cv::cvtColor(cellBgr, gray, cv::COLOR_BGR2GRAY);
+    }
 
     cv::Mat blur;
     cv::GaussianBlur(gray, blur, cv::Size(3, 3), 0);
@@ -313,7 +382,19 @@ static std::vector<PreprocessResult> PreprocessCellVariants(const cv::Mat& cellB
                 if (fg >= 0.06f && fg <= 0.5f) quality += 0.6f;
                 else if (fg < 0.02f || fg > 0.65f) quality -= 0.6f;
 
-                results.push_back({ f, fg, quality });
+                PreprocessResult pr{ f, fg, quality };
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+                if (useCuda) {
+                    try {
+                        pr.gpu28f.upload(f);
+                        pr.hasGpu = true;
+                    }
+                    catch (...) {
+                        pr.hasGpu = false;
+                    }
+                }
+#endif
+                results.push_back(std::move(pr));
             }
         }
     }
@@ -321,6 +402,17 @@ static std::vector<PreprocessResult> PreprocessCellVariants(const cv::Mat& cellB
     if (results.empty()) {
         PreprocessResult r;
         cellBgr.convertTo(r.mat28f, CV_32F, 1.0 / 255.0);
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+        if (useCuda) {
+            try {
+                r.gpu28f.upload(r.mat28f);
+                r.hasGpu = true;
+            }
+            catch (...) {
+                r.hasGpu = false;
+            }
+        }
+#endif
         results.push_back(r);
     }
 
@@ -344,9 +436,15 @@ static float CorrCoeff(const cv::Mat& a28f, const cv::Mat& b28f) {
     return (float)(num / den);
 }
 
-static float BestDigitScore(const cv::Mat& cell28f, const DigitTemplates& dt, int& bestDigit) {
+static float BestDigitScore(const PreprocessResult& cell, const DigitTemplates& dt, int& bestDigit) {
     float bestScore = -1e9f;
     bestDigit = 0;
+    bool useCuda = IsCudaAvailable();
+
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+    cv::cuda::GpuMat cellGpu = cell.hasGpu ? cell.gpu28f : cv::cuda::GpuMat();
+    if (useCuda && cellGpu.empty()) useCuda = false;
+#endif
 
     for (int d = 0; d <= 9; d++) {
         if (!dt.loaded[d]) continue;
@@ -354,19 +452,46 @@ static float BestDigitScore(const cv::Mat& cell28f, const DigitTemplates& dt, in
         if (temps.empty()) continue;
 
         float top1 = -1e9f, top2 = -1e9f, top3 = -1e9f;
-        for (const auto& t : temps) {
-            float s = CorrCoeff(cell28f, t);
-            if (s > top1) {
-                top3 = top2;
-                top2 = top1;
-                top1 = s;
+        
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+        if (useCuda && dt.gpu_loaded[d] && !dt.gpu_t[d].empty()) {
+            for (const auto& t : dt.gpu_t[d]) {
+                cv::cuda::GpuMat result;
+                cv::cuda::matchTemplate(cellGpu, t, result, cv::TM_CCOEFF_NORMED);
+                cv::Mat host;
+                result.download(host);
+                float s = host.at<float>(0, 0);
+                if (s > top1) {
+                    top3 = top2;
+                    top2 = top1;
+                    top1 = s;
+                }
+                else if (s > top2) {
+                    top3 = top2;
+                    top2 = s;
+                }
+                else if (s > top3) {
+                    top3 = s;
+                }
             }
-            else if (s > top2) {
-                top3 = top2;
-                top2 = s;
-            }
-            else if (s > top3) {
-                top3 = s;
+        }
+        else
+#endif
+        {
+            for (const auto& t : temps) {
+                float s = CorrCoeff(cell.mat28f, t);
+                if (s > top1) {
+                    top3 = top2;
+                    top2 = top1;
+                    top1 = s;
+                }
+                else if (s > top2) {
+                    top3 = top2;
+                    top2 = s;
+                }
+                else if (s > top3) {
+                    top3 = s;
+                }
             }
         }
 
@@ -441,7 +566,7 @@ static int OcrBoardByTemplates(
 
             for (const auto& var : variants) {
                 int digit = 0;
-                float score = BestDigitScore(var.mat28f, dt, digit);
+                float score = BestDigitScore(var, dt, digit);
 
                 // prefer higher score; tie-break with preprocess quality
                 if (score > bestScore || (std::abs(score - bestScore) < 1e-4f && var.quality > bestQuality)) {
@@ -455,7 +580,7 @@ static int OcrBoardByTemplates(
             if (bestScore < lowConfThresh && variants.size() > 1) {
                 const auto& alt = variants[std::min<size_t>(1, variants.size() - 1)];
                 int digit = 0;
-                float score = BestDigitScore(alt.mat28f, dt, digit);
+                float score = BestDigitScore(alt, dt, digit);
                 if (score > bestScore) {
                     bestScore = score;
                     bestD = digit;
@@ -563,6 +688,65 @@ static void GBBuildPrefixValCnt(
     }
 }
 
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+static bool GBBuildPrefixValCntCuda(
+    const std::vector<uint8_t>& map,
+    const std::vector<int>& vals,
+    int rows,
+    int cols,
+    std::vector<int>& P_val,
+    std::vector<int>& P_cnt
+) {
+    if (!IsCudaAvailable()) return false;
+
+    try {
+        cv::Mat mapMat(rows, cols, CV_8UC1);
+        cv::Mat valMat(rows, cols, CV_32SC1);
+        auto idx = [cols](int r, int c) { return r * cols + c; };
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                int i = idx(r, c);
+                mapMat.at<uint8_t>(r, c) = map[(size_t)i] ? 1 : 0;
+                valMat.at<int>(r, c) = map[(size_t)i] ? vals[(size_t)i] : 0;
+            }
+        }
+
+        cv::cuda::GpuMat gMap(mapMat);
+        cv::cuda::GpuMat gVal(valMat);
+        cv::cuda::GpuMat gCntPrefix, gValPrefix;
+
+        cv::cuda::integral(gMap, gCntPrefix, CV_32S);
+        cv::cuda::integral(gVal, gValPrefix, CV_32S);
+
+        cv::Mat hCnt, hVal;
+        gCntPrefix.download(hCnt);
+        gValPrefix.download(hVal);
+
+        const size_t total = (size_t)(rows + 1) * (size_t)(cols + 1);
+        P_cnt.assign((const int*)hCnt.ptr<int>(0), (const int*)hCnt.ptr<int>(0) + total);
+        P_val.assign((const int*)hVal.ptr<int>(0), (const int*)hVal.ptr<int>(0) + total);
+        return true;
+    }
+    catch (...) {
+        return false;
+    }
+}
+#endif
+
+static void GBBuildPrefixValCntAuto(
+    const std::vector<uint8_t>& map,
+    const std::vector<int>& vals,
+    int rows,
+    int cols,
+    std::vector<int>& P_val,
+    std::vector<int>& P_cnt
+) {
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+    if (GBBuildPrefixValCntCuda(map, vals, rows, cols, P_val, P_cnt)) return;
+#endif
+    GBBuildPrefixValCnt(map, vals, rows, cols, P_val, P_cnt);
+}
+
 static int GBCountIslands(const std::vector<uint8_t>& map, int rows, int cols) {
     int islands = 0;
     auto idx = [cols](int r, int c) { return r * cols + c; };
@@ -654,7 +838,7 @@ static void GBFastScanRectsV6(
     if (n_active <= 0) return;
 
     std::vector<int> P_val, P_cnt;
-    GBBuildPrefixValCnt(map, vals, rows, cols, P_val, P_cnt);
+    GBBuildPrefixValCntAuto(map, vals, rows, cols, P_val, P_cnt);
 
     outMoves.reserve((size_t)n_active * (size_t)std::min(n_active, 64));
     for (int i = 0; i < n_active; i++) {
