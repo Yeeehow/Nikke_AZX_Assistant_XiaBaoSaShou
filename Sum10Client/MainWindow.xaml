@@ -84,7 +84,7 @@
                 </GroupBox>
 
                 <WrapPanel Margin="0,0,0,10">
-                    <Button Width="140" Margin="0,0,8,8" Content="Solve (Greedy)" Click="BtnSolve_Click"/>
+                    <Button x:Name="BtnSolve" Width="140" Margin="0,0,8,8" Content="Solve (Greedy)" Click="BtnSolve_Click"/>
                     <Button Width="140" Margin="0,0,8,8" Content="Execute Path" Click="BtnExecute_Click"/>
                     <Button Width="140" Margin="0,0,8,8" Content="Execute Grid Set" Click="BtnPickExecCorners_Click"/>
                 </WrapPanel>
