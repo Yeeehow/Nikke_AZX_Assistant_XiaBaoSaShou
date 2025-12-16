@@ -31,7 +31,7 @@
 
                 <TextBlock FontSize="18" FontWeight="Bold" Text="Controls" Margin="0,0,0,8"/>
 
-                <CheckBox x:Name="ChkCuda" Content="启用 CUDA 加速 (OCR + 求解)" IsChecked="True" Margin="0,0,0,10"
+                <CheckBox x:Name="ChkCuda" Content="启用 CUDA 加速 (OCR + 求解)" IsChecked="False" Margin="0,0,0,10"
                           Checked="ChkCuda_Checked" Unchecked="ChkCuda_Checked"/>
                 
                 <WrapPanel Margin="0,0,0,10">
@@ -42,7 +42,7 @@
 
                 <GroupBox Header="模板选择" Margin="0,0,0,10">
                     <StackPanel Margin="10">
-                        <TextBlock Text="数字模板目录 (Assets 内)" Margin="0,0,0,6"/>
+                        <TextBlock Text="选择角色：索林，迪赛尔，布丽德" Margin="0,0,0,6"/>
                         <ComboBox x:Name="CbDigitTemplates" Width="220" SelectionChanged="CbDigitTemplates_SelectionChanged"/>
                         <TextBlock x:Name="TbTemplatePath" Margin="0,6,0,0" TextWrapping="Wrap"/>
                     </StackPanel>
@@ -84,9 +84,8 @@
                 </GroupBox>
 
                 <WrapPanel Margin="0,0,0,10">
-                    <Button x:Name="BtnSolve" Width="140" Margin="0,0,8,8" Content="Solve (Greedy)" Click="BtnSolve_Click"/>
-                    <Button Width="140" Margin="0,0,8,8" Content="Execute Path" Click="BtnExecute_Click"/>
-                    <Button Width="140" Margin="0,0,8,8" Content="Execute Grid Set" Click="BtnPickExecCorners_Click"/>
+                    <Button x:Name="BtnSolve" Width="140" Margin="0,0,8,8" Content="夏宝的脑袋" Click="BtnSolve_Click"/>
+                    <Button Width="140" Margin="0,0,8,8" Content="给他锤爆" Click="BtnExecute_Click"/>
                 </WrapPanel>
 
                 <GroupBox Header="Moves">
