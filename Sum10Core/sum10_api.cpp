@@ -4,6 +4,7 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <sstream>
 
 #include <opencv2/opencv.hpp>
 
@@ -109,25 +110,64 @@ static float ComputeMedian(const cv::Mat& gray) {
     return 127.0f;
 }
 
-static DigitTemplates LoadTemplates(const std::wstring& dir) {
-    DigitTemplates dt;
-    for (int d = 0; d <= 9; d++) {
-        std::wstring pattern = dir + L"\\" + std::to_wstring(d) + L"*.png";
-        std::string spattern = WStringToUtf8(pattern);
+static std::vector<std::wstring> SplitTemplateDirs(const std::wstring& dirList) {
+    std::wstringstream ss(dirList);
+    std::wstring token;
+    std::vector<std::wstring> dirs;
 
-        std::vector<std::string> files;
-        cv::glob(spattern, files, false);
-        for (const auto& path : files) {
-            cv::Mat img = cv::imread(path, cv::IMREAD_GRAYSCALE);
-            if (img.empty()) continue;
+    while (std::getline(ss, token, L';')) {
+        if (!token.empty()) dirs.push_back(token);
+    }
 
-            cv::Mat r;
-            cv::resize(img, r, cv::Size(28, 28));
-            r.convertTo(r, CV_32F, 1.0 / 255.0);
-            dt.t[d].push_back(r);
-            dt.loaded[d] = true;
+    // also allow '|' separator for convenience
+    if (dirs.empty()) {
+        std::wstring t;
+        std::wstringstream ss2(dirList);
+        while (std::getline(ss2, t, L'|')) {
+            if (!t.empty()) dirs.push_back(t);
         }
     }
+
+    if (dirs.empty() && !dirList.empty()) dirs.push_back(dirList);
+    return dirs;
+}
+
+static DigitTemplates LoadTemplates(const std::wstring& dirList) {
+    DigitTemplates dt;
+    auto dirs = SplitTemplateDirs(dirList);
+
+    for (const auto& dir : dirs) {
+        for (int d = 0; d <= 9; d++) {
+            std::wstring pattern = dir + L"\\" + std::to_wstring(d) + L"*.png";
+            std::string spattern = WStringToUtf8(pattern);
+
+            std::vector<std::string> files;
+            cv::glob(spattern, files, false);
+            for (const auto& path : files) {
+                cv::Mat img = cv::imread(path, cv::IMREAD_GRAYSCALE);
+                if (img.empty()) continue;
+
+                cv::Mat r;
+                cv::resize(img, r, cv::Size(28, 28));
+                r.convertTo(r, CV_32F, 1.0 / 255.0);
+                dt.t[d].push_back(r);
+                dt.loaded[d] = true;
+            }
+        }
+    }
+
+    std::wstring summary = L"Loaded digit templates from ";
+    for (size_t i = 0; i < dirs.size(); ++i) {
+        summary += dirs[i];
+        if (i + 1 < dirs.size()) summary += L"; ";
+    }
+    Log(summary);
+
+    for (int d = 0; d <= 9; ++d) {
+        if (dt.t[d].empty()) continue;
+        Log(L"  digit " + std::to_wstring(d) + L" templates: " + std::to_wstring(dt.t[d].size()));
+    }
+
     return dt;
 }
 
@@ -187,12 +227,29 @@ static std::vector<PreprocessResult> PreprocessCellVariants(const cv::Mat& cellB
             bool invert = (median > 120.0f && fgRatio < 0.5f) || fgRatio > 0.6f;
             if (invert) cv::bitwise_not(bin, bin);
 
+            std::vector<cv::Mat> processed;
+            processed.push_back(bin);
+
             for (int k = 2; k <= 3; k++) {
                 cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(k, k));
-                cv::Mat clean;
-                cv::morphologyEx(bin, clean, cv::MORPH_OPEN, kernel);
 
-                cv::Mat trimmed = RefineBounding(clean);
+                cv::Mat opened;
+                cv::morphologyEx(bin, opened, cv::MORPH_OPEN, kernel);
+                processed.push_back(opened);
+
+                cv::Mat closed;
+                cv::morphologyEx(bin, closed, cv::MORPH_CLOSE, kernel);
+                processed.push_back(closed);
+
+                if (k == 2) {
+                    cv::Mat dilated;
+                    cv::dilate(bin, dilated, kernel);
+                    processed.push_back(dilated);
+                }
+            }
+
+            for (auto& proc : processed) {
+                cv::Mat trimmed = RefineBounding(proc);
                 cv::Mat resized;
                 cv::resize(trimmed, resized, cv::Size(28, 28), 0, 0, cv::INTER_AREA);
 
@@ -205,8 +262,8 @@ static std::vector<PreprocessResult> PreprocessCellVariants(const cv::Mat& cellB
                 float fg = (float)cv::countNonZero(resized) / (float)(resized.total() + 1e-6f);
 
                 float quality = var;
-                if (fg >= 0.05f && fg <= 0.4f) quality += 0.5f;
-                else if (fg < 0.02f || fg > 0.6f) quality -= 0.5f;
+                if (fg >= 0.06f && fg <= 0.5f) quality += 0.6f;
+                else if (fg < 0.02f || fg > 0.65f) quality -= 0.6f;
 
                 results.push_back({ f, fg, quality });
             }

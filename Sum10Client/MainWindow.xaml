@@ -37,6 +37,14 @@
                     <Button Width="140" Margin="0,0,8,8" Content="Run OCR" Click="BtnOcr_Click"/>
                 </WrapPanel>
 
+                <GroupBox Header="模板选择" Margin="0,0,0,10">
+                    <StackPanel Margin="10">
+                        <TextBlock Text="数字模板目录 (Assets 内)" Margin="0,0,0,6"/>
+                        <ComboBox x:Name="CbDigitTemplates" Width="220" SelectionChanged="CbDigitTemplates_SelectionChanged"/>
+                        <TextBlock x:Name="TbTemplatePath" Margin="0,6,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                </GroupBox>
+
                 <GroupBox Header="Board Settings" Margin="0,0,0,10">
                     <StackPanel Margin="10">
                         <WrapPanel>

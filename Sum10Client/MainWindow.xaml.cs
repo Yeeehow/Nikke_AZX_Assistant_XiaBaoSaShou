@@ -9,6 +9,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
+using System.Linq;
 
 namespace Sum10Client
 {
@@ -17,7 +18,7 @@ namespace Sum10Client
         private string _workDir;
         private string _screenPng;
         private string _warpPng;
-        private string _digitsDir;
+        private string _digitsDir = string.Empty;
 
         // corners: TL,TR,BR,BL (8 floats)
         private float[] _corners = new float[8];
@@ -52,7 +53,6 @@ namespace Sum10Client
             _workDir = AppDomain.CurrentDomain.BaseDirectory;
             _screenPng = System.IO.Path.Combine(_workDir, "screen.png");
             _warpPng = System.IO.Path.Combine(_workDir, "warped.png");
-            _digitsDir = System.IO.Path.Combine(_workDir, "Assets", "Digits");
 
             Loaded += MainWindow_Loaded;
         }
@@ -78,6 +78,58 @@ namespace Sum10Client
             catch (DllNotFoundException)
             {
                 MessageBox.Show("找不到 Sum10Core.dll。请把 DLL 放到 WPF 输出目录（bin\\x64\\Debug）或项目 Core 文件夹并复制到输出。", "Error");
+            }
+
+            RefreshDigitTemplates();
+        }
+
+        private void RefreshDigitTemplates()
+        {
+            var assetsDir = System.IO.Path.Combine(_workDir, "Assets");
+            var candidates = Directory.Exists(assetsDir)
+                ? Directory.GetDirectories(assetsDir, "Digits*", SearchOption.TopDirectoryOnly)
+                : Array.Empty<string>();
+
+            CbDigitTemplates.Items.Clear();
+
+            if (candidates.Length > 1)
+            {
+                string merged = string.Join(";", candidates.OrderBy(p => p));
+                CbDigitTemplates.Items.Add(new ComboBoxItem { Content = "合并全部", Tag = merged });
+            }
+
+            foreach (var dir in candidates.OrderBy(p => p))
+            {
+                var name = System.IO.Path.GetFileName(dir);
+                CbDigitTemplates.Items.Add(new ComboBoxItem { Content = name, Tag = dir });
+            }
+
+            if (CbDigitTemplates.Items.Count > 0)
+            {
+                ComboBoxItem? target = null;
+
+                if (!string.IsNullOrWhiteSpace(_digitsDir))
+                {
+                    target = CbDigitTemplates.Items
+                        .Cast<ComboBoxItem>()
+                        .FirstOrDefault(i => string.Equals(i.Tag as string, _digitsDir, StringComparison.OrdinalIgnoreCase));
+                }
+
+                CbDigitTemplates.SelectedItem = target ?? CbDigitTemplates.Items[0];
+            }
+            else
+            {
+                TbTemplatePath.Text = "未在 Assets 下找到以 'Digits' 开头的模板目录。";
+            }
+        }
+
+        private void CbDigitTemplates_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (CbDigitTemplates.SelectedItem is ComboBoxItem item && item.Tag is string path)
+            {
+                _digitsDir = path;
+                TbTemplatePath.Text = path;
+                AppendInfo($"已选择模板：{item.Content}");
             }
         }
 
@@ -346,9 +398,10 @@ namespace Sum10Client
                 return;
             }
 
-            if (!Directory.Exists(_digitsDir))
+            var templateDirs = _digitsDir.Split(new[] { ';', '|' }, StringSplitOptions.RemoveEmptyEntries);
+            if (!templateDirs.Any() || !templateDirs.Any(Directory.Exists))
             {
-                MessageBox.Show($"找不到模板目录：{_digitsDir}\n请创建 Assets\\Digits 并放入 0.png~9.png（至少 1~9）。");
+                MessageBox.Show($"找不到模板目录：{_digitsDir}\n请在 Assets 下放置以 Digits* 命名的目录并放入 0.png~9.png（至少 1~9）。");
                 return;
             }
 
