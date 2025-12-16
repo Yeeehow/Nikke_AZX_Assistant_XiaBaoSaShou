@@ -40,6 +40,24 @@ namespace Sum10Client.Services
             out int outScore
         );
 
+        // GodBrain V6.2 solver (beam search + heuristic + hydra)
+        // mode: 0=god, 1=classic, 2=omni
+        [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+        public static extern int sum10_solve_godbrain_v62(
+            int[] digits,
+            int rows,
+            int cols,
+            int beamWidth,
+            int threads,
+            int mode,
+            uint baseSeed,
+            float timeLimitSec,
+            [Out] int[] outMoves,
+            int maxMoves,
+            out int outMoveCount,
+            out int outScore
+        );
+
         [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
         public static extern int sum10_execute_path(
             float[] corners8,

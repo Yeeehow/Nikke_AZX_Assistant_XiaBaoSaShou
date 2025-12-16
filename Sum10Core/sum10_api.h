@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <wchar.h>
 
 #ifdef _WIN32
 #define SUM10_API __declspec(dllexport)
@@ -11,17 +12,17 @@
 
 extern "C" {
 
-    // ÈÕÖ¾»Øµ÷£¨WPF ÓÃÀ´ÏÔÊ¾ log£©
-    typedef void (SUM10_CALL* sum10_log_callback_t)(const wchar_t* msg);
+    // Log callback (WPF uses it to display native logs)
+    typedef void (SUM10_CALL *sum10_log_callback_t)(const wchar_t* msg);
 
-    // ÉèÖÃÈÕÖ¾»Øµ÷
+    // è®¾ç½®æ—¥å¿—å›è°ƒ
     SUM10_API void SUM10_CALL sum10_set_log_callback(sum10_log_callback_t cb);
 
-    // ½ØÆÁ±£´æÎª PNG
+    // æˆªå±ä¿å­˜ä¸º PNG
     SUM10_API int  SUM10_CALL sum10_capture_screen_png(const wchar_t* outPngPath);
 
-    // OCR£ºÊäÈë½ØÍ¼Â·¾¶ + ËÄ½Çµã£¨8 floats£ºTLx,TLy, TRx,TRy, BRx,BRy, BLx,BLy£©
-    // Êä³ö£ºrows*cols µÄ digits£¨int£©£¬avgConf£¨float£©£¬²¢Êä³ö warped Í¼µ½ outWarpPngPath
+    // OCRï¼šè¾“å…¥æˆªå›¾è·¯å¾„ + å››è§’ç‚¹ï¼ˆ8 floatsï¼šTLx,TLy, TRx,TRy, BRx,BRy, BLx,BLyï¼‰
+    // è¾“å‡ºï¼šrows*cols çš„ digitsï¼ˆintï¼‰ï¼ŒavgConfï¼ˆfloatï¼‰ï¼Œå¹¶è¾“å‡º warped å›¾åˆ° outWarpPngPath
     SUM10_API int  SUM10_CALL sum10_ocr_board(
         const wchar_t* screenPngPath,
         const float* corners8,
@@ -34,8 +35,8 @@ extern "C" {
         const wchar_t* outWarpPngPath
     );
 
-    // Çó½âÆ÷£¨×îĞ¡±Õ»·£ºÌ°ĞÄÕÒ sum=10 µÄÈ«¼¤»î¾ØĞÎ£©
-    // outMoves: (r1,c1,r2,c2) * moveCount£¬×î´ó maxMoves
+    // æ±‚è§£å™¨ï¼ˆæœ€å°é—­ç¯ï¼šè´ªå¿ƒæ‰¾ sum=10 çš„å…¨æ¿€æ´»çŸ©å½¢ï¼‰
+    // outMoves: (r1,c1,r2,c2) * moveCountï¼Œæœ€å¤§ maxMoves
     SUM10_API int  SUM10_CALL sum10_solve_greedy(
         const int* digits,
         int rows,
@@ -46,9 +47,30 @@ extern "C" {
         int* outScore
     );
 
-    // Ö´ĞĞÍÏ×§Â·¾¶£¨SendInput£©
-    // offsetX/offsetY£ºÊó±êµãÔÚ cell center µÄÆ«ÒÆ£¨ÏñËØ£©
-    // delayMs£ºÃ¿²½ÍÏ×§µÄÍ£¶Ù
+    // æ±‚è§£å™¨ï¼ˆGodBrain V6.2ï¼šBeam Search + Heuristic + Hydra å¤šçº¿ç¨‹ï¼‰
+    // mode: 0=godï¼ˆP1 classic + P2 omni + å®šå‘çˆ†ç ´ï¼‰, 1=classicï¼ˆåªå…è®¸ count==2ï¼‰, 2=omniï¼ˆå…è®¸ count>=2ï¼‰
+    // outMoves: (r1,c1,r2,c2) * moveCountï¼Œæœ€å¤§ maxMoves
+    // baseSeed: ç”¨äºå¯å¤ç°å®éªŒï¼ˆä¸ Python ç«¯ seed åŒå«ä¹‰ï¼‰
+    // timeLimitSec: æ¯ä¸ª worker çš„æ—¶é—´ä¸Šé™ï¼ˆç§’ï¼‰
+    // threads: Hydra å¹¶å‘ worker æ•°ï¼ˆ<=0 åˆ™ä½¿ç”¨ CPU æ ¸å¿ƒæ•°ï¼‰
+    SUM10_API int  SUM10_CALL sum10_solve_godbrain_v62(
+        const int* digits,
+        int rows,
+        int cols,
+        int beamWidth,
+        int threads,
+        int mode,
+        uint32_t baseSeed,
+        float timeLimitSec,
+        int* outMoves,
+        int maxMoves,
+        int* outMoveCount,
+        int* outScore
+    );
+
+    // æ‰§è¡Œæ‹–æ‹½è·¯å¾„ï¼ˆSendInputï¼‰
+    // offsetX/offsetYï¼šé¼ æ ‡ç‚¹åœ¨ cell center çš„åç§»ï¼ˆåƒç´ ï¼‰
+    // delayMsï¼šæ¯æ­¥æ‹–æ‹½çš„åœé¡¿
     SUM10_API int  SUM10_CALL sum10_execute_path(
         const float* corners8,
         int rows,

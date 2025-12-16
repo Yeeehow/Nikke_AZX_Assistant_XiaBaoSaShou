@@ -10,6 +10,7 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
 using System.Linq;
+using System.Threading.Tasks;
 
 namespace Sum10Client
 {
@@ -141,20 +142,31 @@ namespace Sum10Client
 
         private void BtnCapture_Click(object sender, RoutedEventArgs e)
         {
+            if (!CaptureLatestScreen(keepSelection: false)) return;
+
+            ResetSelection();
+            ResetOcrAndMoves();
+            AppendInfo("截图完成，请按截图工具习惯拖动框选棋盘区域。");
+        }
+
+        private bool CaptureLatestScreen(bool keepSelection = true)
+        {
             int rc = NativeMethods.sum10_capture_screen_png(_screenPng);
             if (rc != 0)
             {
                 MessageBox.Show($"capture failed: {rc}");
-                return;
+                return false;
             }
 
-            ResetSelection();
-            ResetOcrAndMoves();
-            LoadAndShowImage(_screenPng);
-            AppendInfo("截图完成，请按截图工具习惯拖动框选棋盘区域。");
+            LoadAndShowImage(_screenPng, reapplySelection: keepSelection);
+            if (keepSelection && _selectedRectDisplay.HasValue)
+            {
+                AppendInfo("已刷新当前屏幕并保留框选区域，准备实时 OCR。");
+            }
+            return true;
         }
 
-        private void LoadAndShowImage(string path)
+        private void LoadAndShowImage(string path, bool reapplySelection = false)
         {
             if (!File.Exists(path)) return;
 
@@ -171,6 +183,11 @@ namespace Sum10Client
 
             _screenPixelW = bmp.PixelWidth;
             _screenPixelH = bmp.PixelHeight;
+
+            if (reapplySelection && _selectedRectDisplay.HasValue)
+            {
+                SetCornersFromRect(_selectedRectDisplay.Value, logInfo: false);
+            }
 
             RenderOverlay();
         }
@@ -241,7 +258,7 @@ namespace Sum10Client
             RenderOverlay();
         }
 
-            private void FinishDragSelection(Point end)
+        private void FinishDragSelection(Point end)
         {
             _isDragSelecting = false;
             ImgScreen.ReleaseMouseCapture();
@@ -258,7 +275,7 @@ namespace Sum10Client
             RenderOverlay();
         }
 
-        private void SetCornersFromRect(Rect displayRect)
+        private void SetCornersFromRect(Rect displayRect, bool logInfo = true)
         {
             if (!TryGetImageDisplaySize(out double w, out double h)) return;
 
@@ -273,7 +290,19 @@ namespace Sum10Client
             _corners[6] = x0; _corners[7] = y1;
             _cornerCount = 4;
 
-            AppendInfo($"已框选区域：({x0:0},{y0:0}) - ({x1:0},{y1:0})，可直接 OCR。");
+            _execCornerCount = 4;
+            Array.Copy(_corners, _execCorners, _corners.Length);
+
+            _execPointsDisplay.Clear();
+            _execPointsDisplay.Add(new Point(displayRect.X, displayRect.Y));
+            _execPointsDisplay.Add(new Point(displayRect.X + displayRect.Width, displayRect.Y));
+            _execPointsDisplay.Add(new Point(displayRect.X + displayRect.Width, displayRect.Y + displayRect.Height));
+            _execPointsDisplay.Add(new Point(displayRect.X, displayRect.Y + displayRect.Height));
+
+            if (logInfo)
+            {
+                AppendInfo($"已框选区域：({x0:0},{y0:0}) - ({x1:0},{y1:0})，OCR 与 Execute 均使用此四角。");
+            }
         }
 
         private void CaptureExecCorner(Point displayPoint)
@@ -398,6 +427,8 @@ namespace Sum10Client
                 return;
             }
 
+            if (!CaptureLatestScreen(keepSelection: true)) return;
+
             var templateDirs = _digitsDir.Split(new[] { ';', '|' }, StringSplitOptions.RemoveEmptyEntries);
             if (!templateDirs.Any() || !templateDirs.Any(Directory.Exists))
             {
@@ -431,16 +462,7 @@ namespace Sum10Client
 
             TbOcrInfo.Text = $"OCR done. avgConf={avgConf:0.000}. warped saved: {_warpPng}";
             BuildBoardGrid(rows, cols, _digits, _cellConfs);
-
-            // optionally show warped as the main image (你可以改成另开一个窗口）
-            if (File.Exists(_warpPng))
-            {
-                LoadAndShowImage(_warpPng);
-                _selectedRectDisplay = null;
-                _execPointsDisplay.Clear();
-                RenderOverlay();
-                AppendInfo("Showing warped preview image.");
-            }
+            AppendInfo(File.Exists(_warpPng) ? $"Warped 已保存：{_warpPng}" : "Warped 预览未生成。");
         }
 
         private void BuildBoardGrid(int rows, int cols, int[] digits, float[]? confs)
@@ -482,7 +504,7 @@ namespace Sum10Client
             }
         }
 
-        private void BtnSolve_Click(object sender, RoutedEventArgs e)
+        private async void BtnSolve_Click(object sender, RoutedEventArgs e)
         {
             if (_digits == null)
             {
@@ -493,36 +515,97 @@ namespace Sum10Client
             int rows = ReadInt(TbRows, 16);
             int cols = ReadInt(TbCols, 10);
 
+            // Default settings aligned with the Python V6.2 scripts
+            int beamWidth = 1000;
+            int threads = Math.Min(Environment.ProcessorCount, 16);
+            int mode = 0; // 0=god, 1=classic, 2=omni
+            uint baseSeed = unchecked((uint)Environment.TickCount);
+            float timeLimitSec = 25.0f;
+
             int maxMoves = 2000;
             _movesBuf = new int[maxMoves * 4];
 
-            int rc = NativeMethods.sum10_solve_greedy(
-                _digits,
-                rows,
-                cols,
-                _movesBuf,
-                maxMoves,
-                out _moveCount,
-                out int score
-            );
-
-            if (rc != 0)
+            try
             {
-                MessageBox.Show($"Solve failed: {rc}");
-                return;
-            }
+                BtnSolve.IsEnabled = false;
+                Mouse.OverrideCursor = Cursors.Wait;
+                AppendInfo($"Solving (GodBrain V6.2)... beam={beamWidth}, threads={threads}, t={timeLimitSec}s");
 
-            LbMoves.Items.Clear();
-            for (int i = 0; i < _moveCount; i++)
+                int rc = 0;
+                int score = 0;
+
+                await Task.Run(() =>
+                {
+                    rc = NativeMethods.sum10_solve_godbrain_v62(
+                        _digits,
+                        rows,
+                        cols,
+                        beamWidth,
+                        threads,
+                        mode,
+                        baseSeed,
+                        timeLimitSec,
+                        _movesBuf,
+                        maxMoves,
+                        out _moveCount,
+                        out score
+                    );
+                });
+
+                if (rc != 0)
+                {
+                    MessageBox.Show($"Solve failed: {rc}");
+                    return;
+                }
+
+                LbMoves.Items.Clear();
+                for (int i = 0; i < _moveCount; i++)
+                {
+                    int r1 = _movesBuf[i * 4 + 0];
+                    int c1 = _movesBuf[i * 4 + 1];
+                    int r2 = _movesBuf[i * 4 + 2];
+                    int c2 = _movesBuf[i * 4 + 3];
+                    LbMoves.Items.Add($"{i + 1:0000}: ({r1},{c1}) -> ({r2},{c2})");
+                }
+
+                AppendInfo($"Solved (GodBrain V6.2). moves={_moveCount}, score(removed cells)={score}");
+            }
+            catch (EntryPointNotFoundException)
             {
-                int r1 = _movesBuf[i * 4 + 0];
-                int c1 = _movesBuf[i * 4 + 1];
-                int r2 = _movesBuf[i * 4 + 2];
-                int c2 = _movesBuf[i * 4 + 3];
-                LbMoves.Items.Add($"{i + 1:0000}: ({r1},{c1}) -> ({r2},{c2})");
-            }
+                // Backward compatibility if the DLL hasn't been rebuilt/deployed.
+                int rc = NativeMethods.sum10_solve_greedy(
+                    _digits,
+                    rows,
+                    cols,
+                    _movesBuf,
+                    maxMoves,
+                    out _moveCount,
+                    out int score
+                );
 
-            AppendInfo($"Solved (greedy). moves={_moveCount}, score(removed cells)={score}");
+                if (rc != 0)
+                {
+                    MessageBox.Show($"Solve failed: {rc}");
+                    return;
+                }
+
+                LbMoves.Items.Clear();
+                for (int i = 0; i < _moveCount; i++)
+                {
+                    int r1 = _movesBuf[i * 4 + 0];
+                    int c1 = _movesBuf[i * 4 + 1];
+                    int r2 = _movesBuf[i * 4 + 2];
+                    int c2 = _movesBuf[i * 4 + 3];
+                    LbMoves.Items.Add($"{i + 1:0000}: ({r1},{c1}) -> ({r2},{c2})");
+                }
+
+                AppendInfo($"Solved (greedy fallback). moves={_moveCount}, score(removed cells)={score}");
+            }
+            finally
+            {
+                Mouse.OverrideCursor = null;
+                BtnSolve.IsEnabled = true;
+            }
         }
 
         private void BtnExecute_Click(object sender, RoutedEventArgs e)
@@ -540,6 +623,8 @@ namespace Sum10Client
                 return;
             }
 
+            if (!CaptureLatestScreen(keepSelection: true)) return;
+
             int rows = ReadInt(TbRows, 16);
             int cols = ReadInt(TbCols, 10);
             int offX = ReadInt(TbOffX, 0);
@@ -554,7 +639,7 @@ namespace Sum10Client
             System.Threading.Thread.Sleep(2000);
 
             var cornersToUse = (_execCornerCount == 4) ? _execCorners : _corners;
-            AppendInfo(_execCornerCount == 4 ? "使用单独选取的执行角点。" : "使用框选区域四角映射执行。");
+            AppendInfo("使用框选区域四角映射执行。");
 
             int rc = NativeMethods.sum10_execute_path(
                 cornersToUse,
@@ -578,25 +663,7 @@ namespace Sum10Client
 
         private void BtnPickExecCorners_Click(object sender, RoutedEventArgs e)
         {
-            if (_screenBitmap == null)
-            {
-                MessageBox.Show("请先 Capture Screen 并框选棋盘区域。");
-                return;
-            }
-
-            if (_cornerCount < 4)
-            {
-                MessageBox.Show("请先用拖拽框选棋盘，再挑选执行角点。");
-                return;
-            }
-
-            _isPickingExecCorners = true;
-            _execCornerCount = 0;
-            _execPointsDisplay.Clear();
-            Array.Clear(_execCorners, 0, _execCorners.Length);
-            RenderOverlay();
-
-            AppendInfo("请在截图上依次点击执行用的四角点：TL -> TR -> BR -> BL");
+            MessageBox.Show("已与框选联动，拖动框选区域的四个角即为执行角点。", "提示");
         }
 
         private void AppendInfo(string s)

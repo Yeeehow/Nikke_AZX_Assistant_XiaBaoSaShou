@@ -3,8 +3,15 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <sstream>
+#include <memory>
+#include <thread>
+#include <future>
+#include <chrono>
+#include <random>
+#include <mutex>
 
 #include <opencv2/opencv.hpp>
 
@@ -84,6 +91,11 @@ static cv::Mat UnwarpBoard(const cv::Mat& imgBgr, const float* c8) {
     cv::Mat warped;
     cv::warpPerspective(imgBgr, warped, M, cv::Size(maxW, maxH));
     return warped;
+}
+
+// Small helper to avoid requiring C++17 std::clamp.
+static inline int ClampInt(int v, int lo, int hi) {
+    return (v < lo) ? lo : (v > hi) ? hi : v;
 }
 
 // ---------- template OCR ----------
@@ -202,10 +214,14 @@ static std::vector<PreprocessResult> PreprocessCellVariants(const cv::Mat& cellB
     cv::Mat claheGray;
     clahe->apply(gray, claheGray);
 
+    cv::Mat equalized;
+    cv::equalizeHist(gray, equalized);
+
     struct Variant { cv::Mat base; std::string name; };
     std::vector<Variant> bases = {
         { blur, "blur" },
-        { claheGray, "clahe" }
+        { claheGray, "clahe" },
+        { equalized, "equalized" }
     };
 
     std::vector<PreprocessResult> results;
@@ -221,6 +237,14 @@ static std::vector<PreprocessResult> PreprocessCellVariants(const cv::Mat& cellB
         cv::Mat adap;
         cv::adaptiveThreshold(base.base, adap, 255, cv::ADAPTIVE_THRESH_MEAN_C, cv::THRESH_BINARY, 15, 5);
         bins.push_back(adap);
+
+        cv::Mat adapGauss;
+        cv::adaptiveThreshold(base.base, adapGauss, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C, cv::THRESH_BINARY, 17, 3);
+        bins.push_back(adapGauss);
+
+        cv::Mat edges;
+        cv::Canny(base.base, edges, 24, 72);
+        bins.push_back(edges);
 
         for (auto& bin : bins) {
             float fgRatio = (float)cv::countNonZero(bin) / (float)(bin.total() + 1e-6f);
@@ -254,14 +278,31 @@ static std::vector<PreprocessResult> PreprocessCellVariants(const cv::Mat& cellB
                 cv::resize(trimmed, resized, cv::Size(28, 28), 0, 0, cv::INTER_AREA);
 
                 cv::Mat f;
-                resized.convertTo(f, CV_32F, 1.0 / 255.0);
-
                 cv::Scalar mean, stddev;
                 cv::meanStdDev(resized, mean, stddev);
-                float var = (float)(stddev[0] * stddev[0]);
+                float stdVal = (float)stddev[0];
+                if (stdVal > 1e-3f) {
+                    cv::Mat normalized;
+                    resized.convertTo(normalized, CV_32F);
+                    normalized = (normalized - mean[0]) / (stdVal * 4.0f) + 0.5f;
+                    cv::threshold(normalized, normalized, 1.0, 1.0, cv::THRESH_TRUNC);
+                    cv::threshold(normalized, normalized, 0.0, 0.0, cv::THRESH_TOZERO);
+                    f = normalized;
+                }
+                else {
+                    resized.convertTo(f, CV_32F, 1.0 / 255.0);
+                }
+
+                float var = stdVal * stdVal;
                 float fg = (float)cv::countNonZero(resized) / (float)(resized.total() + 1e-6f);
 
-                float quality = var;
+                cv::Mat lap;
+                cv::Laplacian(resized, lap, CV_32F);
+                cv::Scalar lapMean, lapStd;
+                cv::meanStdDev(lap, lapMean, lapStd);
+                float edgeEnergy = (float)(lapStd[0] * lapStd[0]);
+
+                float quality = var + 0.3f * edgeEnergy;
                 if (fg >= 0.06f && fg <= 0.5f) quality += 0.6f;
                 else if (fg < 0.02f || fg > 0.65f) quality -= 0.6f;
 
@@ -284,7 +325,7 @@ static float CorrCoeff(const cv::Mat& a28f, const cv::Mat& b28f) {
     cv::Mat ra = a28f.reshape(1, 1);
     cv::Mat rb = b28f.reshape(1, 1);
 
-    // “ª∏ˆ¿œ∞Ê±æµƒ ÷–¥ matchTemplate µ»–ß
+    // ‰∏Ä‰∏™ËÄÅÁâàÊú¨ÁöÑÊâãÂÜô matchTemplate Á≠âÊïà
     cv::Scalar ma = cv::mean(ra);
     cv::Scalar mb = cv::mean(rb);
 
@@ -305,19 +346,31 @@ static float BestDigitScore(const cv::Mat& cell28f, const DigitTemplates& dt, in
         const auto& temps = dt.t[d];
         if (temps.empty()) continue;
 
-        float top1 = -1e9f, top2 = -1e9f;
+        float top1 = -1e9f, top2 = -1e9f, top3 = -1e9f;
         for (const auto& t : temps) {
             float s = CorrCoeff(cell28f, t);
             if (s > top1) {
+                top3 = top2;
                 top2 = top1;
                 top1 = s;
             }
             else if (s > top2) {
+                top3 = top2;
                 top2 = s;
+            }
+            else if (s > top3) {
+                top3 = s;
             }
         }
 
-        float score = temps.size() >= 2 ? (top1 + top2) * 0.5f : top1;
+        float score = top1;
+        if (temps.size() >= 3) score = top1 * 0.6f + top2 * 0.25f + top3 * 0.15f;
+        else if (temps.size() >= 2) score = top1 * 0.7f + top2 * 0.3f;
+
+        if (top2 > -0.5f && (top1 - top2) < 0.08f) {
+            score -= 0.04f; // down-weight ambiguous matches
+        }
+
         if (score > bestScore) {
             bestScore = score;
             bestDigit = d;
@@ -349,11 +402,11 @@ static int OcrBoardByTemplates(
     float confSum = 0.0f;
     int confCount = 0;
 
-    const float lowConfThresh = 0.6f;
+    const float lowConfThresh = 0.62f;
 
-    // ‘§¡Ù∞≤»´±ﬂæ‡£¨±‹√‚±ﬂœﬂ∏…»≈
-    int marginX = (int)(cellW * 0.12f);
-    int marginY = (int)(cellH * 0.12f);
+    // È¢ÑÁïôÂÆâÂÖ®ËæπË∑ùÔºåÈÅøÂÖçËæπÁ∫øÂπ≤Êâ∞
+    int marginX = (int)(cellW * 0.10f);
+    int marginY = (int)(cellH * 0.10f);
 
     for (int r = 0; r < rows; r++) {
         for (int c = 0; c < cols; c++) {
@@ -391,9 +444,9 @@ static int OcrBoardByTemplates(
                 }
             }
 
-            // fallback: if still low confidence, retry with weakest penalty by reordering variants (already sorted)
+            // fallback: if still low confidence, retry with the second-best pre-process candidate
             if (bestScore < lowConfThresh && variants.size() > 1) {
-                const auto& alt = variants.back();
+                const auto& alt = variants[std::min<size_t>(1, variants.size() - 1)];
                 int digit = 0;
                 float score = BestDigitScore(alt.mat28f, dt, digit);
                 if (score > bestScore) {
@@ -416,6 +469,452 @@ static int OcrBoardByTemplates(
 
 // ---------- greedy solver (sum==10, full-active rectangle) ----------
 struct Move { int r1, c1, r2, c2; };
+
+// ---------- GodBrain V6.2 solver (translated from god_brain_v62.py) ----------
+// NOTE:
+// - This implementation follows the same search strategy / rules / heuristics as the Python version.
+// - RNG streams are independent ("python-random" vs "numpy-random"), but the exact sequences may differ
+//   from CPython/NumPy because we use std::mt19937.
+
+struct GBRect { int r1, c1, r2, c2; };
+struct GBMove { int r1, c1, r2, c2, count; };
+
+struct GBWeights {
+    int w_island{ 0 };
+    double w_fragment{ 0.0 };
+};
+
+enum class GBMode : int {
+    God = 0,
+    Classic = 1,
+    Omni = 2
+};
+
+struct GBPathNode {
+    GBRect move;
+    std::shared_ptr<GBPathNode> prev;
+    int len{ 0 };
+};
+
+struct GBState {
+    std::vector<uint8_t> map; // 0/1 active
+    int score{ 0 };
+    double h_score{ 0.0 };
+    std::shared_ptr<GBPathNode> path; // persistent list
+};
+
+static std::shared_ptr<GBPathNode> GBAppendPath(const std::shared_ptr<GBPathNode>& prev, const GBRect& m) {
+    auto node = std::make_shared<GBPathNode>();
+    node->move = m;
+    node->prev = prev;
+    node->len = (prev ? (prev->len + 1) : 1);
+    return node;
+}
+
+static void GBMaterializePath(const std::shared_ptr<GBPathNode>& tail, std::vector<GBRect>& out) {
+    out.clear();
+    if (!tail) return;
+    out.reserve((size_t)tail->len);
+    for (auto p = tail; p; p = p->prev) out.push_back(p->move);
+    std::reverse(out.begin(), out.end());
+}
+
+static inline int GBRectSum1D(const std::vector<int>& P, int cols, int r1, int c1, int r2, int c2) {
+    // prefix P indexed (r,c) on (rows+1)x(cols+1)
+    auto idx = [cols](int r, int c) { return r * (cols + 1) + c; };
+    int A = P[idx(r2 + 1, c2 + 1)];
+    int B = P[idx(r1, c2 + 1)];
+    int C = P[idx(r2 + 1, c1)];
+    int D = P[idx(r1, c1)];
+    return A - B - C + D;
+}
+
+static void GBBuildPrefixValCnt(
+    const std::vector<uint8_t>& map,
+    const std::vector<int>& vals,
+    int rows,
+    int cols,
+    std::vector<int>& P_val,
+    std::vector<int>& P_cnt
+) {
+    P_val.assign((size_t)(rows + 1) * (size_t)(cols + 1), 0);
+    P_cnt.assign((size_t)(rows + 1) * (size_t)(cols + 1), 0);
+
+    auto idxP = [cols](int r, int c) { return r * (cols + 1) + c; };
+    auto idxC = [cols](int r, int c) { return r * cols + c; };
+
+    for (int r = 1; r <= rows; r++) {
+        for (int c = 1; c <= cols; c++) {
+            int rr = r - 1, cc = c - 1;
+            int ci = idxC(rr, cc);
+            int a = map[(size_t)ci] ? 1 : 0;
+            int v = map[(size_t)ci] ? vals[(size_t)ci] : 0;
+
+            P_val[(size_t)idxP(r, c)] = P_val[(size_t)idxP(r - 1, c)] + P_val[(size_t)idxP(r, c - 1)] - P_val[(size_t)idxP(r - 1, c - 1)] + v;
+            P_cnt[(size_t)idxP(r, c)] = P_cnt[(size_t)idxP(r - 1, c)] + P_cnt[(size_t)idxP(r, c - 1)] - P_cnt[(size_t)idxP(r - 1, c - 1)] + a;
+        }
+    }
+}
+
+static int GBCountIslands(const std::vector<uint8_t>& map, int rows, int cols) {
+    int islands = 0;
+    auto idx = [cols](int r, int c) { return r * cols + c; };
+
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            int i = idx(r, c);
+            if (!map[(size_t)i]) continue;
+
+            // if any 4-neighbor is active -> not an island
+            if (r > 0 && map[(size_t)idx(r - 1, c)]) continue;
+            if (r < rows - 1 && map[(size_t)idx(r + 1, c)]) continue;
+            if (c > 0 && map[(size_t)idx(r, c - 1)]) continue;
+            if (c < cols - 1 && map[(size_t)idx(r, c + 1)]) continue;
+
+            islands++;
+        }
+    }
+    return islands;
+}
+
+static double GBU01(std::mt19937& rng) {
+    static thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
+    return dist(rng);
+}
+
+static int GBUniformInt(std::mt19937& rng, int lo, int hi) {
+    std::uniform_int_distribution<int> dist(lo, hi);
+    return dist(rng);
+}
+
+static double GBEvaluateState(
+    int score,
+    const std::vector<uint8_t>& map,
+    int rows,
+    int cols,
+    const GBWeights& w,
+    std::mt19937& rng_np
+) {
+    // mirrors god_brain_v62.py:_evaluate_state
+    double h = (double)score * 2000.0;
+
+    if (w.w_island > 0) {
+        int islands = GBCountIslands(map, rows, cols);
+        h -= (double)islands * (double)w.w_island;
+    }
+
+    if (w.w_fragment > 0.0) {
+        int center_r = rows / 2;
+        int center_c = cols / 2;
+        double center_mass = 0.0;
+        auto idx = [cols](int r, int c) { return r * cols + c; };
+
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                if (!map[(size_t)idx(r, c)]) continue;
+                int dist = std::abs(r - center_r) + std::abs(c - center_c);
+                center_mass += (20.0 - (double)dist);
+            }
+        }
+
+        h -= center_mass * w.w_fragment;
+    }
+
+    double noise_level = 50.0;
+    if (w.w_island < 20 && w.w_fragment < 1.0) noise_level = 2000.0;
+    h += GBU01(rng_np) * noise_level;
+    return h;
+}
+
+static void GBGetActiveIndices(const std::vector<uint8_t>& map, std::vector<int>& out) {
+    out.clear();
+    out.reserve(map.size());
+    for (int i = 0; i < (int)map.size(); i++) {
+        if (map[(size_t)i]) out.push_back(i);
+    }
+}
+
+static void GBFastScanRectsV6(
+    const std::vector<uint8_t>& map,
+    const std::vector<int>& vals,
+    int rows,
+    int cols,
+    const std::vector<int>& active_indices,
+    std::vector<GBMove>& outMoves
+) {
+    outMoves.clear();
+    const int n_active = (int)active_indices.size();
+    if (n_active <= 0) return;
+
+    std::vector<int> P_val, P_cnt;
+    GBBuildPrefixValCnt(map, vals, rows, cols, P_val, P_cnt);
+
+    outMoves.reserve((size_t)n_active * (size_t)std::min(n_active, 64));
+    for (int i = 0; i < n_active; i++) {
+        const int idx1 = active_indices[(size_t)i];
+        const int r1_raw = idx1 / cols;
+        const int c1_raw = idx1 % cols;
+        for (int j = i; j < n_active; j++) {
+            const int idx2 = active_indices[(size_t)j];
+            const int r2_raw = idx2 / cols;
+            const int c2_raw = idx2 % cols;
+            const int min_r = std::min(r1_raw, r2_raw);
+            const int max_r = std::max(r1_raw, r2_raw);
+            const int min_c = std::min(c1_raw, c2_raw);
+            const int max_c = std::max(c1_raw, c2_raw);
+
+            if (GBRectSum1D(P_val, cols, min_r, min_c, max_r, max_c) != 10) continue;
+            int count = GBRectSum1D(P_cnt, cols, min_r, min_c, max_r, max_c);
+            outMoves.push_back({ min_r, min_c, max_r, max_c, count });
+        }
+    }
+}
+
+static std::vector<uint8_t> GBApplyMoveFast(const std::vector<uint8_t>& map, const GBRect& rect, int cols) {
+    std::vector<uint8_t> out = map;
+    for (int r = rect.r1; r <= rect.r2; r++) {
+        int base = r * cols;
+        for (int c = rect.c1; c <= rect.c2; c++) {
+            out[(size_t)(base + c)] = 0;
+        }
+    }
+    return out;
+}
+
+static int GBApplyMoveInplaceAndCount(std::vector<uint8_t>& map, const GBRect& rect, int cols) {
+    int gained = 0;
+    for (int r = rect.r1; r <= rect.r2; r++) {
+        int base = r * cols;
+        for (int c = rect.c1; c <= rect.c2; c++) {
+            size_t idx = (size_t)(base + c);
+            if (map[idx]) {
+                gained++;
+                map[idx] = 0;
+            }
+            else {
+                map[idx] = 0;
+            }
+        }
+    }
+    return gained;
+}
+
+static GBState GBRunCoreSearchLogic(
+    const std::vector<uint8_t>& start_map,
+    const std::vector<int>& vals,
+    int rows,
+    int cols,
+    int beam_width,
+    GBMode search_mode,
+    int start_score,
+    const std::shared_ptr<GBPathNode>& start_path,
+    const GBWeights& weights,
+    std::mt19937& rng_np,
+    int max_depth = 160
+) {
+    GBState init;
+    init.map = start_map;
+    init.score = start_score;
+    init.path = start_path;
+    init.h_score = GBEvaluateState(start_score, init.map, rows, cols, weights, rng_np);
+
+    std::vector<GBState> current_beam;
+    current_beam.reserve((size_t)std::max(1, beam_width));
+    current_beam.push_back(std::move(init));
+
+    GBState best_state_in_run = current_beam[0];
+
+    std::vector<int> active;
+    std::vector<GBMove> raw_moves;
+    std::vector<GBMove> valid_moves;
+
+    for (int depth = 0; depth < max_depth; depth++) {
+        std::vector<GBState> next_candidates;
+        next_candidates.reserve((size_t)beam_width * 32);
+        bool found_any_move = false;
+
+        for (const auto& state : current_beam) {
+            GBGetActiveIndices(state.map, active);
+            if ((int)active.size() < 2) {
+                if (state.score > best_state_in_run.score) best_state_in_run = state;
+                continue;
+            }
+
+            GBFastScanRectsV6(state.map, vals, rows, cols, active, raw_moves);
+            if (raw_moves.empty()) {
+                if (state.score > best_state_in_run.score) best_state_in_run = state;
+                continue;
+            }
+
+            valid_moves.clear();
+            valid_moves.reserve(raw_moves.size());
+            for (const auto& m : raw_moves) {
+                bool ok = false;
+                if (search_mode == GBMode::Classic) {
+                    if (m.count == 2) ok = true;
+                }
+                else {
+                    if (m.count >= 2) ok = true;
+                }
+                if (ok) valid_moves.push_back(m);
+            }
+
+            if (valid_moves.empty()) {
+                if (state.score > best_state_in_run.score) best_state_in_run = state;
+                continue;
+            }
+
+            found_any_move = true;
+
+            std::stable_sort(valid_moves.begin(), valid_moves.end(), [](const GBMove& a, const GBMove& b) {
+                return a.count > b.count;
+            });
+
+            const size_t take = std::min<size_t>(60, valid_moves.size());
+            for (size_t i = 0; i < take; i++) {
+                const auto& mv = valid_moves[i];
+                GBRect rect{ mv.r1, mv.c1, mv.r2, mv.c2 };
+
+                GBState ns;
+                ns.map = GBApplyMoveFast(state.map, rect, cols);
+                ns.score = state.score + mv.count;
+                ns.h_score = GBEvaluateState(ns.score, ns.map, rows, cols, weights, rng_np);
+                ns.path = GBAppendPath(state.path, rect);
+
+                next_candidates.push_back(std::move(ns));
+            }
+        }
+
+        if (!found_any_move) break;
+        if (next_candidates.empty()) break;
+
+        std::stable_sort(next_candidates.begin(), next_candidates.end(), [](const GBState& a, const GBState& b) {
+            return a.h_score > b.h_score;
+        });
+
+        const size_t keep = std::min<size_t>((size_t)std::max(1, beam_width), next_candidates.size());
+        current_beam.assign(next_candidates.begin(), next_candidates.begin() + keep);
+
+        if (!current_beam.empty() && current_beam[0].score > best_state_in_run.score) {
+            best_state_in_run = current_beam[0];
+        }
+    }
+
+    return best_state_in_run;
+}
+
+struct GBPersonality {
+    GBWeights weights;
+    const wchar_t* role{ L"" };
+};
+
+static GBPersonality GBDispatchPersonality(int workerIndex) {
+    // Matches deep_dive.py's default distribution (and typical V6.2 Hydra usage)
+    GBPersonality p;
+    if (workerIndex < 4) {
+        p.weights.w_island = 0;
+        p.weights.w_fragment = 0.0;
+        p.role = L"Berserker";
+    }
+    else if (workerIndex < 8) {
+        p.weights.w_island = 10;
+        p.weights.w_fragment = 0.1;
+        p.role = L"Light Walker";
+    }
+    else if (workerIndex < 12) {
+        p.weights.w_island = 5;
+        p.weights.w_fragment = 0.01;
+        p.role = L"Chaos Gambler";
+    }
+    else {
+        p.weights.w_island = 63;
+        p.weights.w_fragment = 1.0;
+        p.role = L"Tactician";
+    }
+    return p;
+}
+
+static GBState GBSolveProcessHydra(
+    const std::vector<int>& vals,
+    int rows,
+    int cols,
+    int beam_width,
+    GBMode mode,
+    uint32_t seed,
+    double time_limit_sec,
+    const GBPersonality& personality
+) {
+    const uint32_t safe_seed = (uint32_t)(seed % 0xFFFFFFFFu);
+
+    std::mt19937 rng_np(safe_seed);
+    std::mt19937 rng_py(safe_seed);
+
+    std::vector<uint8_t> initial_map((size_t)rows * (size_t)cols, 1);
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // 1) Base run
+    GBState base_state;
+    if (mode == GBMode::God) {
+        GBWeights p1w = personality.weights;
+        if (p1w.w_island > 0) {
+            // python: p1_weights['w_island'] *= 0.5
+            p1w.w_island = (int)std::lround((double)p1w.w_island * 0.5);
+        }
+
+        GBState p1 = GBRunCoreSearchLogic(initial_map, vals, rows, cols, beam_width, GBMode::Classic, 0, nullptr, p1w, rng_np);
+        base_state = GBRunCoreSearchLogic(p1.map, vals, rows, cols, beam_width, GBMode::Omni, p1.score, p1.path, personality.weights, rng_np);
+    }
+    else {
+        base_state = GBRunCoreSearchLogic(initial_map, vals, rows, cols, beam_width, mode, 0, nullptr, personality.weights, rng_np);
+    }
+
+    GBState best_final_state = base_state;
+
+    // 2) Directed destruction loop
+    for (;;) {
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - t0).count();
+        if (elapsed >= time_limit_sec) break;
+
+        std::vector<GBRect> path;
+        GBMaterializePath(best_final_state.path, path);
+        if (path.size() < 5) break;
+
+        int L = (int)path.size();
+
+        int cut_start;
+        if (GBU01(rng_py) < 0.3) cut_start = GBUniformInt(rng_py, L / 2, L - 3);
+        else cut_start = GBUniformInt(rng_py, 0, L - 3);
+
+        int maxCut = std::min(12, L - cut_start);
+        int cut_len = GBUniformInt(rng_py, 3, maxCut); // kept for equivalence; intentionally unused
+        (void)cut_len;
+
+        std::vector<uint8_t> temp_map((size_t)rows * (size_t)cols, 1);
+        int prefix_score = 0;
+        std::shared_ptr<GBPathNode> prefix_path = nullptr;
+
+        for (int i = 0; i < cut_start; i++) {
+            const auto& rect = path[(size_t)i];
+            prefix_score += GBApplyMoveInplaceAndCount(temp_map, rect, cols);
+            prefix_path = GBAppendPath(prefix_path, rect);
+        }
+
+        GBWeights repair = personality.weights;
+        repair.w_island += GBUniformInt(rng_py, -50, 50);
+
+        int widened = (int)std::lround((double)beam_width * 1.2);
+        if (widened < 1) widened = 1;
+
+        GBState repaired = GBRunCoreSearchLogic(temp_map, vals, rows, cols, widened, GBMode::Omni, prefix_score, prefix_path, repair, rng_np);
+        if (repaired.score > best_final_state.score) {
+            best_final_state = std::move(repaired);
+        }
+    }
+
+    return best_final_state;
+}
 
 static int RectSum(const std::vector<int>& ps, int cols, int r1, int c1, int r2, int c2) {
     // prefix sum ps indexed (r,c) on (rows+1)x(cols+1)
@@ -475,7 +974,7 @@ static int SolveGreedySum10(
         Move best{};
         int bestArea = 0;
 
-        // O(R^2*C^2) ◊„πª≈‹–°∆Â≈Ã
+        // O(R^2*C^2) Ë∂≥Â§üË∑ëÂ∞èÊ£ãÁõò
         for (int r1 = 0; r1 < rows; r1++) {
             for (int r2 = r1; r2 < rows; r2++) {
                 for (int c1 = 0; c1 < cols; c1++) {
@@ -487,7 +986,7 @@ static int SolveGreedySum10(
                         int s = RectSum(psSum, cols, r1, c1, r2, c2);
                         if (s != 10) continue;
 
-                        // Ã∞–ƒ£∫”≈œ»—°∏¸¥Û√Êª˝
+                        // Ë¥™ÂøÉÔºö‰ºòÂÖàÈÄâÊõ¥Â§ßÈù¢ÁßØ
                         if (area > bestArea) {
                             bestArea = area;
                             best = { r1, c1, r2, c2 };
@@ -518,7 +1017,7 @@ static int SolveGreedySum10(
 
 // ---------- automation (SendInput) ----------
 static void EnsureDpiAware() {
-    // Windows 10+£∫per-monitor v2
+    // Windows 10+Ôºöper-monitor v2
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
     if (!user32) return;
 
@@ -530,8 +1029,8 @@ static void EnsureDpiAware() {
 static void MoveMouseAbs(int x, int y) {
     int sw = GetSystemMetrics(SM_CXSCREEN);
     int sh = GetSystemMetrics(SM_CYSCREEN);
-    x = std::clamp(x, 0, sw - 1);
-    y = std::clamp(y, 0, sh - 1);
+    x = ClampInt(x, 0, sw - 1);
+    y = ClampInt(y, 0, sh - 1);
 
     INPUT in{};
     in.type = INPUT_MOUSE;
@@ -586,12 +1085,14 @@ static void Drag(POINT a, POINT b, int delayMs) {
 }
 
 // ---------- exported API ----------
-void SUM10_CALL sum10_set_log_callback(sum10_log_callback_t cb) {
+extern "C" {
+
+SUM10_API void SUM10_CALL sum10_set_log_callback(sum10_log_callback_t cb) {
     g_log_cb = cb;
     Log(L"[Native] log callback set.");
 }
 
-int SUM10_CALL sum10_capture_screen_png(const wchar_t* outPngPath) {
+SUM10_API int SUM10_CALL sum10_capture_screen_png(const wchar_t* outPngPath) {
     try {
         cv::Mat bgra = CaptureScreenBGRA();
         cv::Mat bgr;
@@ -609,7 +1110,7 @@ int SUM10_CALL sum10_capture_screen_png(const wchar_t* outPngPath) {
     }
 }
 
-int SUM10_CALL sum10_ocr_board(
+SUM10_API int SUM10_CALL sum10_ocr_board(
     const wchar_t* screenPngPath,
     const float* corners8,
     int rows,
@@ -656,7 +1157,7 @@ int SUM10_CALL sum10_ocr_board(
     }
 }
 
-int SUM10_CALL sum10_solve_greedy(
+SUM10_API int SUM10_CALL sum10_solve_greedy(
     const int* digits,
     int rows,
     int cols,
@@ -692,7 +1193,100 @@ int SUM10_CALL sum10_solve_greedy(
     }
 }
 
-int SUM10_CALL sum10_execute_path(
+SUM10_API int SUM10_CALL sum10_solve_godbrain_v62(
+    const int* digits,
+    int rows,
+    int cols,
+    int beamWidth,
+    int threads,
+    int mode,
+    uint32_t baseSeed,
+    float timeLimitSec,
+    int* outMoves,
+    int maxMoves,
+    int* outMoveCount,
+    int* outScore
+) {
+    try {
+        if (!digits || !outMoves || !outMoveCount || !outScore) return -1;
+        if (rows <= 0 || cols <= 0) return -2;
+        if (beamWidth <= 0) return -3;
+        if (maxMoves <= 0) return -4;
+        if (!(mode == 0 || mode == 1 || mode == 2)) return -5;
+
+        const int N = rows * cols;
+        std::vector<int> vals((size_t)N);
+        for (int i = 0; i < N; i++) vals[(size_t)i] = digits[i];
+
+        int hw = (int)std::thread::hardware_concurrency();
+        int workerCount = threads;
+        if (workerCount <= 0) workerCount = (hw > 0 ? hw : 1);
+        workerCount = std::max(1, std::min(workerCount, 64));
+
+        GBMode gbMode = GBMode::God;
+        if (mode == 1) gbMode = GBMode::Classic;
+        else if (mode == 2) gbMode = GBMode::Omni;
+
+        double tl = (double)timeLimitSec;
+        if (tl <= 0.0) tl = 0.001;
+
+        Log(L"[Native] GodBrain V6.2 solving...");
+        {
+            std::wstringstream ss;
+            ss << L"[Native] cfg beam=" << beamWidth << L", threads=" << workerCount << L", mode=" << mode << L", t=" << timeLimitSec << L"s";
+            Log(ss.str().c_str());
+        }
+
+        // Run Hydra workers
+        std::vector<std::future<GBState>> futs;
+        futs.reserve((size_t)workerCount);
+
+        for (int i = 0; i < workerCount; i++) {
+            const uint32_t seed = baseSeed + (uint32_t)i;
+            const GBPersonality p = GBDispatchPersonality(i);
+
+            futs.push_back(std::async(std::launch::async, [vals, rows, cols, beamWidth, gbMode, seed, tl, p]() {
+                return GBSolveProcessHydra(vals, rows, cols, beamWidth, gbMode, seed, tl, p);
+            }));
+        }
+
+        GBState best;
+        bool hasBest = false;
+        for (int i = 0; i < (int)futs.size(); i++) {
+            GBState st = futs[(size_t)i].get();
+            if (!hasBest || st.score > best.score) {
+                best = std::move(st);
+                hasBest = true;
+            }
+        }
+
+        std::vector<GBRect> path;
+        GBMaterializePath(best.path, path);
+
+        const int n = (int)std::min((size_t)maxMoves, path.size());
+        for (int i = 0; i < n; i++) {
+            outMoves[i * 4 + 0] = path[(size_t)i].r1;
+            outMoves[i * 4 + 1] = path[(size_t)i].c1;
+            outMoves[i * 4 + 2] = path[(size_t)i].r2;
+            outMoves[i * 4 + 3] = path[(size_t)i].c2;
+        }
+
+        *outMoveCount = n;
+        *outScore = best.score;
+
+        {
+            std::wstringstream ss;
+            ss << L"[Native] GodBrain done. score=" << best.score << L", moves=" << n;
+            Log(ss.str().c_str());
+        }
+        return 0;
+    }
+    catch (...) {
+        return -100;
+    }
+}
+
+SUM10_API int SUM10_CALL sum10_execute_path(
     const float* corners8,
     int rows,
     int cols,
@@ -728,3 +1322,5 @@ int SUM10_CALL sum10_execute_path(
         return -100;
     }
 }
+
+} // extern "C"
