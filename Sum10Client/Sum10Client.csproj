@@ -9,6 +9,16 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <None Remove="Assets\Digits2\0.png" />
+    <None Remove="Assets\Digits2\1.png" />
+    <None Remove="Assets\Digits2\2.png" />
+    <None Remove="Assets\Digits2\3.png" />
+    <None Remove="Assets\Digits2\4.png" />
+    <None Remove="Assets\Digits2\5.png" />
+    <None Remove="Assets\Digits2\6.png" />
+    <None Remove="Assets\Digits2\7.png" />
+    <None Remove="Assets\Digits2\8.png" />
+    <None Remove="Assets\Digits2\9.png" />
     <None Remove="Assets\Digits\0.png" />
     <None Remove="Assets\Digits\1.png" />
     <None Remove="Assets\Digits\2.png" />
@@ -22,6 +32,36 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Content Include="Assets\Digits2\0.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Assets\Digits2\1.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Assets\Digits2\2.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Assets\Digits2\3.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Assets\Digits2\4.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Assets\Digits2\5.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Assets\Digits2\6.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Assets\Digits2\7.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Assets\Digits2\8.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Assets\Digits2\9.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="Assets\Digits\0.png">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
