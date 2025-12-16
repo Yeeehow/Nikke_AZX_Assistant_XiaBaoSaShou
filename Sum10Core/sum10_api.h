@@ -18,6 +18,9 @@ extern "C" {
     // 设置日志回调
     SUM10_API void SUM10_CALL sum10_set_log_callback(sum10_log_callback_t cb);
 
+    // 启用/禁用 CUDA 加速（1=启用，0=禁用）。默认启用。
+    SUM10_API void SUM10_CALL sum10_set_cuda_enabled(int enabled);
+
     // 截屏保存为 PNG
     SUM10_API int  SUM10_CALL sum10_capture_screen_png(const wchar_t* outPngPath);
 

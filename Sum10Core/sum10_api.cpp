@@ -12,6 +12,7 @@
 #include <chrono>
 #include <random>
 #include <mutex>
+#include <atomic>
 
 #include <opencv2/opencv.hpp>
 #if defined(HAVE_OPENCV_CUDAIMGPROC)
@@ -32,6 +33,7 @@ static void Log(const std::wstring& s) {
 #if defined(HAVE_OPENCV_CUDAIMGPROC)
 static bool g_cuda_available = false;
 static std::once_flag g_cuda_once;
+static std::atomic<bool> g_cuda_user_enabled{ true };
 
 static void DetectCudaOnce() {
     try {
@@ -50,7 +52,7 @@ static void DetectCudaOnce() {
 
 static bool IsCudaAvailable() {
     std::call_once(g_cuda_once, DetectCudaOnce);
-    return g_cuda_available;
+    return g_cuda_available && g_cuda_user_enabled.load();
 }
 #else
 static bool IsCudaAvailable() { return false; }
@@ -722,6 +724,13 @@ static bool GBBuildPrefixValCntCuda(
         gCntPrefix.download(hCnt);
         gValPrefix.download(hVal);
 
+        if (!hCnt.isContinuous()) hCnt = hCnt.clone();
+        if (!hVal.isContinuous()) hVal = hVal.clone();
+
+        if (hCnt.rows != rows + 1 || hCnt.cols != cols + 1 || hVal.rows != rows + 1 || hVal.cols != cols + 1) {
+            return false;
+        }
+
         const size_t total = (size_t)(rows + 1) * (size_t)(cols + 1);
         P_cnt.assign((const int*)hCnt.ptr<int>(0), (const int*)hCnt.ptr<int>(0) + total);
         P_val.assign((const int*)hVal.ptr<int>(0), (const int*)hVal.ptr<int>(0) + total);
@@ -1281,6 +1290,28 @@ extern "C" {
 SUM10_API void SUM10_CALL sum10_set_log_callback(sum10_log_callback_t cb) {
     g_log_cb = cb;
     Log(L"[Native] log callback set.");
+}
+
+SUM10_API void SUM10_CALL sum10_set_cuda_enabled(int enabled) {
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+    std::call_once(g_cuda_once, DetectCudaOnce);
+    g_cuda_user_enabled.store(enabled != 0);
+
+    if (enabled) {
+        if (g_cuda_available) {
+            Log(L"[Native] CUDA acceleration enabled by user.");
+        }
+        else {
+            Log(L"[Native] CUDA requested but no compatible device found; using CPU fallback.");
+        }
+    }
+    else {
+        Log(L"[Native] CUDA acceleration disabled by user; forcing CPU path.");
+    }
+#else
+    (void)enabled;
+    Log(L"[Native] CUDA acceleration not compiled; CPU path only.");
+#endif
 }
 
 SUM10_API int SUM10_CALL sum10_capture_screen_png(const wchar_t* outPngPath) {

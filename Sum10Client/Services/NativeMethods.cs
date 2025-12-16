@@ -13,6 +13,9 @@ namespace Sum10Client.Services
         [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Unicode)]
         public static extern void sum10_set_log_callback(Sum10LogCallback cb);
 
+        [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+        public static extern void sum10_set_cuda_enabled(int enabled);
+
         [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Unicode)]
         public static extern int sum10_capture_screen_png(string outPngPath);
 

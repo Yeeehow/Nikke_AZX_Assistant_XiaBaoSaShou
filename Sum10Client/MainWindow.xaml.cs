@@ -81,6 +81,7 @@ namespace Sum10Client
                 MessageBox.Show("找不到 Sum10Core.dll。请把 DLL 放到 WPF 输出目录（bin\\x64\\Debug）或项目 Core 文件夹并复制到输出。", "Error");
             }
 
+            ApplyCudaToggle(ChkCuda.IsChecked == true);
             RefreshDigitTemplates();
         }
 
@@ -134,12 +135,30 @@ namespace Sum10Client
             }
         }
 
+        private void ChkCuda_Checked(object sender, RoutedEventArgs e)
+        {
+            ApplyCudaToggle(ChkCuda.IsChecked == true);
+        }
+        
         private int ReadInt(TextBox tb, int fallback)
         {
             if (int.TryParse(tb.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int v)) return v;
             return fallback;
         }
 
+        private void ApplyCudaToggle(bool enabled)
+        {
+            try
+            {
+                NativeMethods.sum10_set_cuda_enabled(enabled ? 1 : 0);
+                AppendInfo(enabled ? "CUDA 加速已启用（若检测到设备）" : "CUDA 加速已关闭，强制走 CPU。");
+            }
+            catch (DllNotFoundException)
+            {
+                MessageBox.Show("找不到 Sum10Core.dll，无法设置 CUDA 开关。", "Error");
+            }
+        }
+        
         private void BtnCapture_Click(object sender, RoutedEventArgs e)
         {
             if (!CaptureLatestScreen(keepSelection: false)) return;

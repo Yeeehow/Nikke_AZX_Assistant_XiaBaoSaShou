@@ -31,6 +31,9 @@
 
                 <TextBlock FontSize="18" FontWeight="Bold" Text="Controls" Margin="0,0,0,8"/>
 
+                <CheckBox x:Name="ChkCuda" Content="启用 CUDA 加速 (OCR + 求解)" IsChecked="True" Margin="0,0,0,10"
+                          Checked="ChkCuda_Checked" Unchecked="ChkCuda_Checked"/>
+                
                 <WrapPanel Margin="0,0,0,10">
                     <Button Width="140" Margin="0,0,8,8" Content="Capture Screen" Click="BtnCapture_Click"/>
                     <Button Width="140" Margin="0,0,8,8" Content="Reset 4 Points" Click="BtnResetPoints_Click"/>
