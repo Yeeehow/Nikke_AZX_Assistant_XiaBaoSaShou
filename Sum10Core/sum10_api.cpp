@@ -183,6 +183,13 @@ static DigitTemplates LoadTemplates(const std::wstring& dirList) {
     return dt;
 }
 
+static bool HasAnyTemplate(const DigitTemplates& dt) {
+    for (int d = 0; d <= 9; ++d) {
+        if (!dt.t[d].empty()) return true;
+    }
+    return false;
+}
+
 struct PreprocessResult {
     cv::Mat mat28f;
     float fgRatio{ 0.0f };
@@ -1136,6 +1143,10 @@ SUM10_API int SUM10_CALL sum10_ocr_board(
         cv::imwrite(wp, warped);
 
         DigitTemplates dt = LoadTemplates(digitTemplateDir);
+        if (!HasAnyTemplate(dt)) {
+            Log(L"[Native] OCR aborted: no digit templates found.");
+            return -4;
+        }
         std::vector<int> digits;
         std::vector<float> cellConfs;
         float avgConf = 0.0f;
