@@ -87,52 +87,139 @@ static cv::Mat UnwarpBoard(const cv::Mat& imgBgr, const float* c8) {
 
 // ---------- template OCR ----------
 struct DigitTemplates {
-    // index 0..9, empty if missing
-    cv::Mat t[10];
+    // index 0..9, allow multiple templates per digit
+    std::vector<cv::Mat> t[10];
     bool loaded[10]{};
 };
+
+static float ComputeMedian(const cv::Mat& gray) {
+    CV_Assert(gray.type() == CV_8U);
+    int histSize = 256;
+    float range[] = { 0, 256 };
+    const float* ranges[] = { range };
+    cv::Mat hist;
+    int channels[] = { 0 };
+    cv::calcHist(&gray, 1, channels, cv::Mat(), hist, 1, &histSize, ranges, true, false);
+    float cum = 0.0f;
+    float half = (float)(gray.total() / 2.0);
+    for (int i = 0; i < histSize; i++) {
+        cum += hist.at<float>(i);
+        if (cum >= half) return (float)i;
+    }
+    return 127.0f;
+}
 
 static DigitTemplates LoadTemplates(const std::wstring& dir) {
     DigitTemplates dt;
     for (int d = 0; d <= 9; d++) {
-        std::wstring wpath = dir + L"\\" + std::to_wstring(d) + L".png";
-        std::string path = WStringToUtf8(wpath);
-        cv::Mat img = cv::imread(path, cv::IMREAD_GRAYSCALE);
-        if (img.empty()) continue;
+        std::wstring pattern = dir + L"\\" + std::to_wstring(d) + L"*.png";
+        std::string spattern = WStringToUtf8(pattern);
 
-        cv::Mat r;
-        cv::resize(img, r, cv::Size(28, 28));
-        r.convertTo(r, CV_32F, 1.0 / 255.0);
-        dt.t[d] = r;
-        dt.loaded[d] = true;
+        std::vector<std::string> files;
+        cv::glob(spattern, files, false);
+        for (const auto& path : files) {
+            cv::Mat img = cv::imread(path, cv::IMREAD_GRAYSCALE);
+            if (img.empty()) continue;
+
+            cv::Mat r;
+            cv::resize(img, r, cv::Size(28, 28));
+            r.convertTo(r, CV_32F, 1.0 / 255.0);
+            dt.t[d].push_back(r);
+            dt.loaded[d] = true;
+        }
     }
     return dt;
 }
 
-static void PreprocessCell(const cv::Mat& cellBgr, cv::Mat& out28f) {
+struct PreprocessResult {
+    cv::Mat mat28f;
+    float fgRatio{ 0.0f };
+    float quality{ 0.0f };
+};
+
+static cv::Mat RefineBounding(const cv::Mat& bin) {
+    cv::Mat nz;
+    cv::findNonZero(bin, nz);
+    if (nz.empty()) return bin;
+
+    cv::Rect box = cv::boundingRect(nz);
+    // small margin to avoid cutting strokes
+    box.x = std::max(box.x - 1, 0);
+    box.y = std::max(box.y - 1, 0);
+    box.width = std::min(box.width + 2, bin.cols - box.x);
+    box.height = std::min(box.height + 2, bin.rows - box.y);
+    return bin(box);
+}
+
+static std::vector<PreprocessResult> PreprocessCellVariants(const cv::Mat& cellBgr) {
     cv::Mat gray;
     cv::cvtColor(cellBgr, gray, cv::COLOR_BGR2GRAY);
 
     cv::Mat blur;
     cv::GaussianBlur(gray, blur, cv::Size(3, 3), 0);
 
-    cv::Mat bin;
-    cv::threshold(blur, bin, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+    cv::Mat claheGray;
+    clahe->apply(gray, claheGray);
 
-    // 让数字为白色，背景黑色（若相反则取反）
-    double meanVal = cv::mean(bin)[0];
-    if (meanVal > 127) {
-        cv::bitwise_not(bin, bin);
+    struct Variant { cv::Mat base; std::string name; };
+    std::vector<Variant> bases = {
+        { blur, "blur" },
+        { claheGray, "clahe" }
+    };
+
+    std::vector<PreprocessResult> results;
+    for (const auto& base : bases) {
+        float median = ComputeMedian(base.base);
+
+        // two thresholding strategies: otsu and adaptive mean
+        std::vector<cv::Mat> bins;
+        cv::Mat otsu;
+        cv::threshold(base.base, otsu, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+        bins.push_back(otsu);
+
+        cv::Mat adap;
+        cv::adaptiveThreshold(base.base, adap, 255, cv::ADAPTIVE_THRESH_MEAN_C, cv::THRESH_BINARY, 15, 5);
+        bins.push_back(adap);
+
+        for (auto& bin : bins) {
+            float fgRatio = (float)cv::countNonZero(bin) / (float)(bin.total() + 1e-6f);
+            bool invert = (median > 120.0f && fgRatio < 0.5f) || fgRatio > 0.6f;
+            if (invert) cv::bitwise_not(bin, bin);
+
+            for (int k = 2; k <= 3; k++) {
+                cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(k, k));
+                cv::Mat clean;
+                cv::morphologyEx(bin, clean, cv::MORPH_OPEN, kernel);
+
+                cv::Mat trimmed = RefineBounding(clean);
+                cv::Mat resized;
+                cv::resize(trimmed, resized, cv::Size(28, 28), 0, 0, cv::INTER_AREA);
+
+                cv::Mat f;
+                resized.convertTo(f, CV_32F, 1.0 / 255.0);
+
+                cv::Scalar mean, stddev;
+                cv::meanStdDev(resized, mean, stddev);
+                float var = (float)(stddev[0] * stddev[0]);
+                float fg = (float)cv::countNonZero(resized) / (float)(resized.total() + 1e-6f);
+
+                float quality = var;
+                if (fg >= 0.05f && fg <= 0.4f) quality += 0.5f;
+                else if (fg < 0.02f || fg > 0.6f) quality -= 0.5f;
+
+                results.push_back({ f, fg, quality });
+            }
+        }
     }
 
-    // 简单去噪
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2));
-    cv::morphologyEx(bin, bin, cv::MORPH_OPEN, kernel);
+    if (results.empty()) {
+        PreprocessResult r;
+        cellBgr.convertTo(r.mat28f, CV_32F, 1.0 / 255.0);
+        results.push_back(r);
+    }
 
-    cv::Mat resized;
-    cv::resize(bin, resized, cv::Size(28, 28), 0, 0, cv::INTER_AREA);
-
-    resized.convertTo(out28f, CV_32F, 1.0 / 255.0);
+    return results;
 }
 
 static float CorrCoeff(const cv::Mat& a28f, const cv::Mat& b28f) {
@@ -140,7 +227,7 @@ static float CorrCoeff(const cv::Mat& a28f, const cv::Mat& b28f) {
     cv::Mat ra = a28f.reshape(1, 1);
     cv::Mat rb = b28f.reshape(1, 1);
 
-    // 归一化相关系数（手写版本，避免 matchTemplate 限制）
+    // 一个老版本的手写 matchTemplate 等效
     cv::Scalar ma = cv::mean(ra);
     cv::Scalar mb = cv::mean(rb);
 
@@ -152,15 +239,48 @@ static float CorrCoeff(const cv::Mat& a28f, const cv::Mat& b28f) {
     return (float)(num / den);
 }
 
+static float BestDigitScore(const cv::Mat& cell28f, const DigitTemplates& dt, int& bestDigit) {
+    float bestScore = -1e9f;
+    bestDigit = 0;
+
+    for (int d = 0; d <= 9; d++) {
+        if (!dt.loaded[d]) continue;
+        const auto& temps = dt.t[d];
+        if (temps.empty()) continue;
+
+        float top1 = -1e9f, top2 = -1e9f;
+        for (const auto& t : temps) {
+            float s = CorrCoeff(cell28f, t);
+            if (s > top1) {
+                top2 = top1;
+                top1 = s;
+            }
+            else if (s > top2) {
+                top2 = s;
+            }
+        }
+
+        float score = temps.size() >= 2 ? (top1 + top2) * 0.5f : top1;
+        if (score > bestScore) {
+            bestScore = score;
+            bestDigit = d;
+        }
+    }
+
+    return bestScore;
+}
+
 static int OcrBoardByTemplates(
     const cv::Mat& warpedBgr,
     int rows,
     int cols,
     const DigitTemplates& dt,
     std::vector<int>& outDigits,
-    float& outAvgConf
+    float& outAvgConf,
+    std::vector<float>* outCellConfs
 ) {
     outDigits.assign(rows * cols, 0);
+    if (outCellConfs) outCellConfs->assign(rows * cols, 0.0f);
 
     int W = warpedBgr.cols;
     int H = warpedBgr.rows;
@@ -172,7 +292,9 @@ static int OcrBoardByTemplates(
     float confSum = 0.0f;
     int confCount = 0;
 
-    // 可调：裁掉网格线（留边）
+    const float lowConfThresh = 0.6f;
+
+    // 预留安全边距，避免边线干扰
     int marginX = (int)(cellW * 0.12f);
     int marginY = (int)(cellH * 0.12f);
 
@@ -191,22 +313,41 @@ static int OcrBoardByTemplates(
             cv::Rect roi(x0, y0, x1 - x0, y1 - y0);
             cv::Mat cell = warpedBgr(roi);
 
-            cv::Mat cell28f;
-            PreprocessCell(cell, cell28f);
+            auto variants = PreprocessCellVariants(cell);
+            std::sort(variants.begin(), variants.end(), [](const PreprocessResult& a, const PreprocessResult& b) {
+                return a.quality > b.quality;
+                });
 
             int bestD = 0;
             float bestScore = -1e9f;
+            float bestQuality = -1e9f;
 
-            for (int d = 0; d <= 9; d++) {
-                if (!dt.loaded[d]) continue;
-                float s = CorrCoeff(cell28f, dt.t[d]);
-                if (s > bestScore) {
-                    bestScore = s;
-                    bestD = d;
+            for (const auto& var : variants) {
+                int digit = 0;
+                float score = BestDigitScore(var.mat28f, dt, digit);
+
+                // prefer higher score; tie-break with preprocess quality
+                if (score > bestScore || (std::abs(score - bestScore) < 1e-4f && var.quality > bestQuality)) {
+                    bestScore = score;
+                    bestD = digit;
+                    bestQuality = var.quality;
                 }
             }
 
-            outDigits[r * cols + c] = bestD;
+            // fallback: if still low confidence, retry with weakest penalty by reordering variants (already sorted)
+            if (bestScore < lowConfThresh && variants.size() > 1) {
+                const auto& alt = variants.back();
+                int digit = 0;
+                float score = BestDigitScore(alt.mat28f, dt, digit);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestD = digit;
+                }
+            }
+
+            int idx = r * cols + c;
+            outDigits[idx] = bestD;
+            if (outCellConfs) (*outCellConfs)[idx] = bestScore;
             confSum += bestScore;
             confCount++;
         }
@@ -419,6 +560,7 @@ int SUM10_CALL sum10_ocr_board(
     const wchar_t* digitTemplateDir,
     int* outDigits,
     float* outAvgConf,
+    float* outCellConf,
     const wchar_t* outWarpPngPath
 ) {
     try {
@@ -437,12 +579,16 @@ int SUM10_CALL sum10_ocr_board(
 
         DigitTemplates dt = LoadTemplates(digitTemplateDir);
         std::vector<int> digits;
+        std::vector<float> cellConfs;
         float avgConf = 0.0f;
 
-        int rc = OcrBoardByTemplates(warped, rows, cols, dt, digits, avgConf);
+        int rc = OcrBoardByTemplates(warped, rows, cols, dt, digits, avgConf, outCellConf ? &cellConfs : nullptr);
         if (rc != 0) return rc;
 
-        for (int i = 0; i < rows * cols; i++) outDigits[i] = digits[i];
+        for (int i = 0; i < rows * cols; i++) {
+            outDigits[i] = digits[i];
+            if (outCellConf && i < (int)cellConfs.size()) outCellConf[i] = cellConfs[i];
+        }
         *outAvgConf = avgConf;
 
         Log(L"[Native] OCR done.");

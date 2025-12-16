@@ -30,6 +30,7 @@ extern "C" {
         const wchar_t* digitTemplateDir,
         int* outDigits,
         float* outAvgConf,
+        float* outCellConf,
         const wchar_t* outWarpPngPath
     );
 

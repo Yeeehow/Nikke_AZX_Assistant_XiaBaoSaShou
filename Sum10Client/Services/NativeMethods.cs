@@ -25,6 +25,7 @@ namespace Sum10Client.Services
             string digitTemplateDir,
             [Out] int[] outDigits,
             out float outAvgConf,
+            [Out] float[] outCellConf,
             string outWarpPngPath
         );
 

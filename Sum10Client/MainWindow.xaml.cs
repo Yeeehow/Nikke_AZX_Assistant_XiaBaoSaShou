@@ -38,6 +38,7 @@ namespace Sum10Client
         private int _screenPixelH = 0;
 
         private int[]? _digits;
+        private float[]? _cellConfs;
         private int[]? _movesBuf;
         private int _moveCount = 0;
 
@@ -325,6 +326,7 @@ namespace Sum10Client
         private void ResetOcrAndMoves()
         {
             _digits = null;
+            _cellConfs = null;
             _movesBuf = null;
             _moveCount = 0;
 
@@ -354,6 +356,7 @@ namespace Sum10Client
             int cols = ReadInt(TbCols, 17);
 
             _digits = new int[rows * cols];
+            _cellConfs = new float[rows * cols];
 
             int rc = NativeMethods.sum10_ocr_board(
                 _screenPng,
@@ -363,6 +366,7 @@ namespace Sum10Client
                 _digitsDir,
                 _digits,
                 out float avgConf,
+                _cellConfs,
                 _warpPng
             );
 
@@ -373,7 +377,7 @@ namespace Sum10Client
             }
 
             TbOcrInfo.Text = $"OCR done. avgConf={avgConf:0.000}. warped saved: {_warpPng}";
-            BuildBoardGrid(rows, cols, _digits);
+            BuildBoardGrid(rows, cols, _digits, _cellConfs);
 
             // optionally show warped as the main image (你可以改成另开一个窗口）
             if (File.Exists(_warpPng))
@@ -386,7 +390,7 @@ namespace Sum10Client
             }
         }
 
-        private void BuildBoardGrid(int rows, int cols, int[] digits)
+        private void BuildBoardGrid(int rows, int cols, int[] digits, float[]? confs)
         {
             BoardGrid.Rows = rows;
             BoardGrid.Columns = cols;
@@ -402,6 +406,11 @@ namespace Sum10Client
                     FontSize = 14
                 };
 
+                if (confs != null && i < confs.Length)
+                {
+                    tb.ToolTip = $"conf={confs[i]:0.000}";
+                }
+
                 var border = new Border
                 {
                     BorderBrush = Brushes.LightGray,
@@ -409,6 +418,13 @@ namespace Sum10Client
                     Padding = new Thickness(6),
                     Child = tb
                 };
+
+                if (confs != null && i < confs.Length)
+                {
+                    double conf = confs[i];
+                    if (conf < 0.5) border.Background = new SolidColorBrush(Color.FromRgb(255, 204, 204));
+                    else if (conf < 0.65) border.Background = new SolidColorBrush(Color.FromRgb(255, 235, 205));
+                }
                 BoardGrid.Children.Add(border);
             }
         }
