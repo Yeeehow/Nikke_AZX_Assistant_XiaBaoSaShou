@@ -14,7 +14,10 @@
                 <Grid>
                     <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
                         <Grid>
-                            <Image x:Name="ImgScreen" Stretch="Uniform" MouseLeftButtonDown="ImgScreen_MouseLeftButtonDown"/>
+                            <Image x:Name="ImgScreen" Stretch="Uniform"
+                                   MouseLeftButtonDown="ImgScreen_MouseLeftButtonDown"
+                                   MouseMove="ImgScreen_MouseMove"
+                                   MouseLeftButtonUp="ImgScreen_MouseLeftButtonUp"/>
                             <Canvas x:Name="Overlay" IsHitTestVisible="False"/>
                         </Grid>
                     </ScrollViewer>
@@ -72,6 +75,7 @@
                 <WrapPanel Margin="0,0,0,10">
                     <Button Width="140" Margin="0,0,8,8" Content="Solve (Greedy)" Click="BtnSolve_Click"/>
                     <Button Width="140" Margin="0,0,8,8" Content="Execute Path" Click="BtnExecute_Click"/>
+                    <Button Width="140" Margin="0,0,8,8" Content="Execute Grid Set" Click="BtnPickExecCorners_Click"/>
                 </WrapPanel>
 
                 <GroupBox Header="Moves">

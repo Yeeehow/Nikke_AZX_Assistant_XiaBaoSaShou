@@ -23,6 +23,16 @@ namespace Sum10Client
         private float[] _corners = new float[8];
         private int _cornerCount = 0;
 
+        // optional: dedicated execution corners (if user wants refined mapping)
+        private float[] _execCorners = new float[8];
+        private int _execCornerCount = 0;
+
+        private bool _isDragSelecting = false;
+        private bool _isPickingExecCorners = false;
+        private Point _dragStart;
+        private Rect? _selectedRectDisplay;
+        private readonly List<Point> _execPointsDisplay = new();
+
         private BitmapImage? _screenBitmap;
         private int _screenPixelW = 0;
         private int _screenPixelH = 0;
@@ -85,9 +95,10 @@ namespace Sum10Client
                 return;
             }
 
+            ResetSelection();
+            ResetOcrAndMoves();
             LoadAndShowImage(_screenPng);
-            AppendInfo("Captured. Now click 4 points in order: TL -> TR -> BR -> BL");
-            ResetPointsOnly();
+            AppendInfo("截图完成，请按截图工具习惯拖动框选棋盘区域。");
         }
 
         private void LoadAndShowImage(string path)
@@ -108,55 +119,137 @@ namespace Sum10Client
             _screenPixelW = bmp.PixelWidth;
             _screenPixelH = bmp.PixelHeight;
 
-            Overlay.Children.Clear();
+            RenderOverlay();
         }
 
         private void BtnResetPoints_Click(object sender, RoutedEventArgs e)
         {
-            ResetPointsOnly();
-            Overlay.Children.Clear();
-            AppendInfo("Points reset. Click 4 points: TL -> TR -> BR -> BL");
-        }
-
-        private void ResetPointsOnly()
-        {
-            _cornerCount = 0;
-            Array.Clear(_corners, 0, _corners.Length);
+            ResetSelection();
+            AppendInfo("已重置选择，请在截图上拖动框选棋盘区域。");
         }
 
         private void ImgScreen_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
             if (_screenBitmap == null) return;
-            if (_cornerCount >= 4) return;
-
-            // get click position in Image control
             Point p = e.GetPosition(ImgScreen);
-            double displayW = ImgScreen.ActualWidth;
-            double displayH = ImgScreen.ActualHeight;
 
-            if (displayW <= 1 || displayH <= 1) return;
+            if (_isPickingExecCorners)
+            {
+                CaptureExecCorner(p);
+                return;
+            }
 
-            // map to actual pixel
-            float px = (float)(p.X * _screenPixelW / displayW);
-            float py = (float)(p.Y * _screenPixelH / displayH);
+            StartDragSelection(p);
+        }
 
-            int idx = _cornerCount * 2;
-            _corners[idx] = px;
-            _corners[idx + 1] = py;
+        private void ImgScreen_MouseMove(object sender, MouseEventArgs e)
+        {
+            if (!_isDragSelecting) return;
+            Point p = e.GetPosition(ImgScreen);
+            UpdateDragSelection(p);
+        }
 
-            DrawPointOnOverlay(p, _cornerCount);
-            _cornerCount++;
+        private void ImgScreen_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            if (!_isDragSelecting) return;
+            Point p = e.GetPosition(ImgScreen);
+            FinishDragSelection(p);
+        }
+
+        private bool TryGetImageDisplaySize(out double w, out double h)
+        {
+            w = ImgScreen.ActualWidth;
+            h = ImgScreen.ActualHeight;
+            return w > 1 && h > 1 && _screenPixelW > 1 && _screenPixelH > 1;
+        }
+
+        private void StartDragSelection(Point p)
+        {
+            if (!TryGetImageDisplaySize(out _, out _)) return;
+
+            _isDragSelecting = true;
+            _isPickingExecCorners = false;
+            _dragStart = p;
+
+            _cornerCount = 0;
+            Array.Clear(_corners, 0, _corners.Length);
+
+            _execCornerCount = 0;
+            _execPointsDisplay.Clear();
+
+            ImgScreen.CaptureMouse();
+            UpdateDragSelection(p);
+        }
+
+        private void UpdateDragSelection(Point current)
+        {
+            var rect = new Rect(_dragStart, current);
+            _selectedRectDisplay = rect;
+            RenderOverlay();
+        }
+
+            private void FinishDragSelection(Point end)
+        {
+            _isDragSelecting = false;
+            ImgScreen.ReleaseMouseCapture();
+
+            var rect = new Rect(_dragStart, end);
+            if (rect.Width < 4 || rect.Height < 4)
+            {
+                AppendInfo("框选区域太小，请重新拖动。");
+                return;
+            }
+
+            _selectedRectDisplay = rect;
+            SetCornersFromRect(rect);
+            RenderOverlay();
+        }
+
+        private void SetCornersFromRect(Rect displayRect)
+        {
+            if (!TryGetImageDisplaySize(out double w, out double h)) return;
+
+            float x0 = (float)(displayRect.X * _screenPixelW / w);
+            float y0 = (float)(displayRect.Y * _screenPixelH / h);
+            float x1 = (float)((displayRect.X + displayRect.Width) * _screenPixelW / w);
+            float y1 = (float)((displayRect.Y + displayRect.Height) * _screenPixelH / h);
+
+            _corners[0] = x0; _corners[1] = y0;
+            _corners[2] = x1; _corners[3] = y0;
+            _corners[4] = x1; _corners[5] = y1;
+            _corners[6] = x0; _corners[7] = y1;
+            _cornerCount = 4;
+
+            AppendInfo($"已框选区域：({x0:0},{y0:0}) - ({x1:0},{y1:0})，可直接 OCR。");
+        }
+
+        private void CaptureExecCorner(Point displayPoint)
+        {
+            if (_execCornerCount >= 4) return;
+            if (!TryGetImageDisplaySize(out double w, out double h)) return;
+
+            float px = (float)(displayPoint.X * _screenPixelW / w);
+            float py = (float)(displayPoint.Y * _screenPixelH / h);
+
+            int idx = _execCornerCount * 2;
+            _execCorners[idx] = px;
+            _execCorners[idx + 1] = py;
+            _execCornerCount++;
+
+            _execPointsDisplay.Add(displayPoint);
+            RenderOverlay();
 
             string[] names = { "TL", "TR", "BR", "BL" };
-            AppendInfo($"Captured {names[_cornerCount - 1]}: ({px:0},{py:0})");
+            AppendInfo($"执行角点 {names[_execCornerCount - 1]} 已选择: ({px:0},{py:0})");
 
-            if (_cornerCount == 4)
+            if (_execCornerCount == 4)
             {
-                AppendInfo("4 points ready. Click Run OCR.");
+                _isPickingExecCorners = false;
+                AppendInfo("执行用的 4 角点就绪，可点击 Execute。");
             }
         }
 
-        private void DrawPointOnOverlay(Point p, int i)
+        private void DrawPointOnOverlay(Point p, int i, Brush fill, Brush textColor)
         {
             // overlay uses same coordinate space as Image (display space)
             double r = 6;
@@ -164,7 +257,7 @@ namespace Sum10Client
             {
                 Width = r * 2,
                 Height = r * 2,
-                Fill = Brushes.Red,
+                Fill = fill,
                 Stroke = Brushes.White,
                 StrokeThickness = 2
             };
@@ -175,7 +268,7 @@ namespace Sum10Client
             var txt = new TextBlock
             {
                 Text = (i + 1).ToString(),
-                Foreground = Brushes.Yellow,
+                Foreground = textColor,
                 FontWeight = FontWeights.Bold
             };
             Canvas.SetLeft(txt, p.X + 6);
@@ -183,11 +276,71 @@ namespace Sum10Client
             Overlay.Children.Add(txt);
         }
 
+        private void DrawSelectionRect(Rect rect)
+        {
+            var box = new Rectangle
+            {
+                Width = Math.Abs(rect.Width),
+                Height = Math.Abs(rect.Height),
+                Stroke = Brushes.LimeGreen,
+                StrokeThickness = 2,
+                Fill = new SolidColorBrush(Color.FromArgb(40, 0, 255, 0))
+            };
+
+            Canvas.SetLeft(box, Math.Min(rect.X, rect.X + rect.Width));
+            Canvas.SetTop(box, Math.Min(rect.Y, rect.Y + rect.Height));
+            Overlay.Children.Add(box);
+        }
+
+        private void RenderOverlay()
+        {
+            Overlay.Children.Clear();
+
+            if (_selectedRectDisplay.HasValue)
+            {
+                DrawSelectionRect(_selectedRectDisplay.Value);
+            }
+
+            for (int i = 0; i < _execPointsDisplay.Count; i++)
+            {
+                DrawPointOnOverlay(_execPointsDisplay[i], i, Brushes.DeepSkyBlue, Brushes.White);
+            }
+        }
+
+        private void ResetSelection()
+        {
+            _cornerCount = 0;
+            _execCornerCount = 0;
+            _isDragSelecting = false;
+            _isPickingExecCorners = false;
+            _selectedRectDisplay = null;
+            _execPointsDisplay.Clear();
+
+            Array.Clear(_corners, 0, _corners.Length);
+            Array.Clear(_execCorners, 0, _execCorners.Length);
+
+            RenderOverlay();
+        }
+
+        private void ResetOcrAndMoves()
+        {
+            _digits = null;
+            _movesBuf = null;
+            _moveCount = 0;
+
+            TbOcrInfo.Text = "-";
+            LbMoves.Items.Clear();
+
+            BoardGrid.Children.Clear();
+            BoardGrid.Rows = 1;
+            BoardGrid.Columns = 1;
+        }
+
         private void BtnOcr_Click(object sender, RoutedEventArgs e)
         {
             if (_cornerCount < 4)
             {
-                MessageBox.Show("请先在截图上点 4 个角点（TL->TR->BR->BL）。");
+                MessageBox.Show("请先在截图上框选棋盘区域。");
                 return;
             }
 
@@ -226,6 +379,9 @@ namespace Sum10Client
             if (File.Exists(_warpPng))
             {
                 LoadAndShowImage(_warpPng);
+                _selectedRectDisplay = null;
+                _execPointsDisplay.Clear();
+                RenderOverlay();
                 AppendInfo("Showing warped preview image.");
             }
         }
@@ -308,9 +464,10 @@ namespace Sum10Client
                 return;
             }
 
-            if (_cornerCount < 4)
+            int cornerReady = (_execCornerCount == 4) ? 4 : _cornerCount;
+            if (cornerReady < 4)
             {
-                MessageBox.Show("需要四角点（TL->TR->BR->BL）来映射鼠标位置。");
+                MessageBox.Show("需要有效的棋盘框选或执行角点来映射鼠标位置。");
                 return;
             }
 
@@ -327,8 +484,11 @@ namespace Sum10Client
             AppendInfo("Execute starts in 2 seconds...");
             System.Threading.Thread.Sleep(2000);
 
+            var cornersToUse = (_execCornerCount == 4) ? _execCorners : _corners;
+            AppendInfo(_execCornerCount == 4 ? "使用单独选取的执行角点。" : "使用框选区域四角映射执行。");
+
             int rc = NativeMethods.sum10_execute_path(
-                _corners,
+                cornersToUse,
                 rows,
                 cols,
                 _movesBuf,
@@ -345,6 +505,29 @@ namespace Sum10Client
             }
 
             AppendInfo("Execute completed.");
+        }
+
+        private void BtnPickExecCorners_Click(object sender, RoutedEventArgs e)
+        {
+            if (_screenBitmap == null)
+            {
+                MessageBox.Show("请先 Capture Screen 并框选棋盘区域。");
+                return;
+            }
+
+            if (_cornerCount < 4)
+            {
+                MessageBox.Show("请先用拖拽框选棋盘，再挑选执行角点。");
+                return;
+            }
+
+            _isPickingExecCorners = true;
+            _execCornerCount = 0;
+            _execPointsDisplay.Clear();
+            Array.Clear(_execCorners, 0, _execCorners.Length);
+            RenderOverlay();
+
+            AppendInfo("请在截图上依次点击执行用的四角点：TL -> TR -> BR -> BL");
         }
 
         private void AppendInfo(string s)
